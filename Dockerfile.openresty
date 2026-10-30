@@ -14,8 +14,11 @@ COPY --from=deps /usr/local/openresty/site/lualib/resty/ /usr/local/openresty/si
 # Access-log directory for the waf_logs volume: owned by the unprivileged
 # runtime user (nobody), so a fresh named volume inherits that ownership.
 RUN mkdir -p /var/log/waf && chown 65534:65534 /var/log/waf
+# Same for the waf_config volume: the site chosen on the admin page.
+RUN mkdir -p /var/lib/waf && chown 65534:65534 /var/lib/waf
 
-# nginx.conf and waf_interceptor.lua are bind-mounted read-only by
+# nginx.conf and the Lua files are bind-mounted read-only by
 # docker-compose.yml, so config changes only need `docker compose restart openresty`.
-EXPOSE 8080
+# 8080: the WAF. 8081: the admin page (published on 127.0.0.1 only).
+EXPOSE 8080 8081
 CMD ["/usr/local/openresty/bin/openresty", "-g", "daemon off;"]

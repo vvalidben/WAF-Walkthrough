@@ -25,9 +25,11 @@ ML_ATTACK = "7 AND ASCII(SUBSTRING((SELECT password FROM users LIMIT 1),1,1))>77
 BACKEND_TEXT = "backend_app reached"
 
 
-def request(url: str, method: str = "GET", body: dict | None = None) -> tuple[int, str]:
+def request(url: str, method: str = "GET", body: dict | None = None,
+            headers: dict | None = None) -> tuple[int, str]:
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json", **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             return response.status, response.read().decode()
@@ -66,6 +68,7 @@ def engines_by_request_id() -> dict[str, str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--url", default="http://localhost:8080")
+    parser.add_argument("--admin-url", default="http://127.0.0.1:8081")
     parser.add_argument("--timeout", type=float, default=120, help="Seconds to wait for the stack")
     parser.add_argument("--compose-logs", action="store_true", help="Also check engines in `docker compose logs`")
     args = parser.parse_args()
@@ -78,9 +81,9 @@ def main() -> int:
 
     failures = []
 
-    def expect(name: str, result: tuple[int, str], status: int) -> dict:
+    def expect(name: str, result: tuple[int, str], status: int, backend: bool = True) -> dict:
         code, body = result
-        ok = code == status and (status != 200 or BACKEND_TEXT in body)
+        ok = code == status and (status != 200 or not backend or BACKEND_TEXT in body)
         print(f"{'ok  ' if ok else 'FAIL'} {name}: HTTP {code}")
         if not ok:
             failures.append(name)
@@ -94,6 +97,36 @@ def main() -> int:
     regex_block = expect("signature attack is blocked", get(base, REGEX_ATTACK), 403)
     ml_block = expect("ML-only attack is blocked", get(base, ML_ATTACK), 403)
     expect("attack in a JSON body is blocked", request(f"{base}/api", "POST", {"id": REGEX_ATTACK}), 403)
+
+    # Admin page: switching the protected site. Restores whatever was set before.
+    admin = args.admin_url.rstrip("/")
+    before = json.loads(request(f"{admin}/api/target")[1])
+    expect("admin page is served", request(f"{admin}/"), 200, backend=False)
+    expect("admin rejects a non-http address", request(f"{admin}/api/target", "POST", {"url": "ftp://x.test"}), 400)
+    expect("admin refuses to expose the ML API", request(f"{admin}/api/target", "POST", {"url": "http://ml-api:8000"}), 400)
+    expect("admin rejects a cross-site request",
+           request(f"{admin}/api/target", "POST", {"url": "http://backend_app:8080"},
+                   headers={"Origin": "https://evil.test"}), 403)
+    expect("admin rejects a foreign Host (DNS rebinding)",
+           request(f"{admin}/api/target", headers={"Host": "evil.test"}), 403)
+    code, body = request(f"{admin}/api/target", "POST", {"url": "http://backend_app:8080/some/page"})
+    switched = json.loads(body) if code == 200 else {}
+    expect("admin switches the target", (code, body), 200, backend=False)
+    ok = switched.get("url") == "http://backend_app:8080" and switched.get("source") == "admin"
+    print(f"{'ok  ' if ok else 'FAIL'} admin normalizes the address (got {switched.get('url')!r})")
+    if not ok:
+        failures.append("admin normalize")
+    expect("benign traffic reaches the new target", get(base, "blue shoes"), 200)
+    code, body = request(f"{admin}/api/test", "POST", {})
+    test = json.loads(body) if code == 200 else {}
+    ok = test.get("attack", {}).get("status") == 403 and test.get("benign", {}).get("status") == 200
+    print(f"{'ok  ' if ok else 'FAIL'} admin self-test: attack blocked, normal request let through ({test})")
+    if not ok:
+        failures.append("admin self-test")
+    if before.get("source") == "admin":
+        request(f"{admin}/api/target", "POST", {"url": before["url"], "force": True})
+    else:
+        expect("admin resets to .env", request(f"{admin}/api/reset", "POST", {}), 200, backend=False)
 
     if args.compose_logs:
         time.sleep(1)  # let the access log flush

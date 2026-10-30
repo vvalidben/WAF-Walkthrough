@@ -16,6 +16,7 @@ text_preprocessing.py -> preprocessing shared by training and the ONNX-serving A
 api.py         -> serves POST /scan, POST /scan/batch and GET /health
 Dockerfile, gunicorn.conf.py                          -> ML API container
 nginx.conf, waf_interceptor.lua, Dockerfile.openresty -> WAF proxy container
+waf_target.lua, waf_admin.lua, admin/                 -> admin page (127.0.0.1:8081): paste a URL to protect that site
 docker-compose.yml                                    -> WAF + ML API + placeholder backend
 loadtest.py                                           -> load test: inspection outcomes under concurrency
 monitoring/                                           -> Grafana Alloy, Loki and Grafana config + the "WAF SIEM" dashboard
@@ -214,7 +215,17 @@ docker compose down
 
 ### Pointing the WAF at your own site
 
-Set `WAF_BACKEND_URL` in `.env` instead of editing `nginx.conf`; the default is the placeholder. After changing it, run `docker compose up -d openresty`.
+**Easiest: the admin page.** Open <http://127.0.0.1:8081>, paste your site's address (`my-app.vercel.app`, `https://example.com/any/page`, `localhost:3000`) and click **Protect this site**. The WAF checks that the site answers, then switches to it on the next request, with no restart. **Run test** sends one normal request and one SQL injection through the WAF and shows what was let through and what was blocked.
+
+What the page works out for you:
+- Missing `https://` is added, and any path is dropped: the WAF protects the whole site.
+- `localhost` / `127.0.0.1` become `host.docker.internal`, because inside the container `localhost` is the container itself.
+- Public hostnames are also sent as the `Host` header (what `WAF_BACKEND_HOST` does below). Vercel and Netlify need this to route the request.
+- It refuses non-HTTP addresses and the stack's own services (`ml-api`, `grafana`, …), which would otherwise be exposed through the WAF.
+
+The choice is saved on the `waf_config` volume and survives restarts. It overrides `.env` until you click **Go back to the site set in .env**. Target changes are logged to `docker compose logs openresty` ("WAF admin: now protecting …"). The page is published on `127.0.0.1` only (`WAF_ADMIN_PORT`, default 8081), and its API refuses requests with a foreign `Host` or `Origin` header, so a website open in your browser can't change the target. Anyone with a shell on this machine can, so don't publish port 8081 beyond localhost.
+
+**Or set it in `.env`.** Set `WAF_BACKEND_URL` in `.env` instead of editing `nginx.conf`; the default is the placeholder. After changing it, run `docker compose up -d openresty`. This applies whenever no site is saved from the admin page.
 
 | Where your app runs | `.env` |
 |---|---|
@@ -602,6 +613,7 @@ WAF (`openresty` service). Any new variable must also be declared with `env` in 
 | `WAF_CACHE_TTL_S` | `300` | Verdict cache lifetime; `0` disables the cache |
 | `WAF_ALERT_INCLUDE_VALUES` | `true` | Include flagged values in alerts |
 | `WAF_PORT` | `8080` | Compose only: host port |
+| `WAF_ADMIN_PORT` | `8081` | Compose only: host port of the admin page, bound to `127.0.0.1` |
 | `GRAFANA_ADMIN_PASSWORD` | **required** | Grafana `admin` password; compose refuses to start without it. Keep it in `.env`. |
 | `GRAFANA_PORT` | `3000` | Compose only: Grafana's port, bound to 127.0.0.1 |
 

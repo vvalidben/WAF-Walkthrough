@@ -10,6 +10,8 @@ services:
     image: sqli-waf-openresty:1.0.0
     ports:
       - "${WAF_PORT:-8080}:8080"
+      # Admin page (paste a URL to protect it): this machine only.
+      - "127.0.0.1:${WAF_ADMIN_PORT:-8081}:8081"
     environment:
       WAF_SCAN_URL: http://ml-api:8000/scan/batch
       WAF_MODE: ${WAF_MODE:-block}                       # block | monitor
@@ -32,9 +34,10 @@ services:
       WAF_ALERT_INCLUDE_VALUES: ${WAF_ALERT_INCLUDE_VALUES:-true}
       # Hourly access-log files kept on the waf_logs volume (Loki keeps the history).
       WAF_LOG_RETENTION_HOURS: ${WAF_LOG_RETENTION_HOURS:-24}
-      # The protected app. Default: the placeholder backend_app. Point it at your
-      # own site in .env, e.g. http://host.docker.internal:3000 (an app on the
-      # host) or http://service-name:port (another compose service on the app network).
+      # The protected app. Default: the placeholder backend_app. Easiest: paste
+      # your site's URL on the admin page (http://127.0.0.1:8081), which
+      # overrides these two. Or set them in .env, e.g. http://host.docker.internal:3000
+      # (an app on the host) or http://service-name:port (another compose service on the app network).
       WAF_BACKEND_URL: ${WAF_BACKEND_URL:-http://backend_app:8080}
       # For a remote HTTPS backend, its hostname (routing + SNI). Empty = pass the visitor's Host.
       WAF_BACKEND_HOST: ${WAF_BACKEND_HOST:-}
@@ -44,8 +47,13 @@ services:
     volumes:
       - ./nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
       - ./waf_interceptor.lua:/etc/openresty/waf/waf_interceptor.lua:ro
+      - ./waf_target.lua:/etc/openresty/waf/waf_target.lua:ro
+      - ./waf_admin.lua:/etc/openresty/waf/waf_admin.lua:ro
+      - ./admin:/etc/openresty/waf/admin:ro
       # JSON access logs (json_waf), read by Alloy.
       - waf_logs:/var/log/waf
+      # The site chosen on the admin page, kept across restarts.
+      - waf_config:/var/lib/waf
     networks:
       - app
       - ml
@@ -230,6 +238,7 @@ networks:
 
 volumes:
   waf_logs: {}
+  waf_config: {}
   alloy_data: {}
   loki_data: {}
   grafana_data: {}
