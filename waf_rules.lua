@@ -101,6 +101,29 @@ local SIGNATURES = (function()
               .. [=[|\b(?:alert|prompt|confirm)\s*+(?:\(\s*+(?:\d++|['"`][^'"`]*+['"`]]=]
               .. [=[|(?:document|window)\s*+\.\s*+\w++)?\s*+\)|`[^`]*+`)]=] },
 
+        -- Specific exploit families come before the generic ones: the first match
+        -- names the category, and a Shellshock payload also contains "bash -c"
+        -- (cmdi), an XXE payload often "/etc/passwd" (lfi).
+
+        -- Exploits for known-vulnerable components: Log4Shell (also nested
+        -- ${${lower:j}ndi:...} forms), Shellshock, Struts/OGNL, Spring4Shell
+        -- and Java deserialization (case-sensitive base64/hex magic bytes).
+        { id = "log4shell", category = "rce",
+          pattern = [=[\$\{\s*+(?:jndi\s*+:|(?:lower|upper|env|sys|date|main|base64|ctx|k8s|docker|spring]=]
+              .. [=[|web|java|marker|bundle|sd|event)\s*+:|::-|\$\{)]=] },
+        { id = "shellshock", category = "rce",
+          pattern = [=[\(\s*+\)\s*+\{\s*+(?::|\w++\s*+\(\s*+\))\s*+;]=] },
+        { id = "ognl_injection", category = "rce",
+          pattern = [=[#_memberaccess\b|@java\.lang\.(?:runtime|processbuilder|system)\b|\bognl\.ognlcontext\b]=]
+              .. [=[|#context\[|\bclass\.module\.classloader\b]=] },
+        { id = "java_deserialization", category = "rce",
+          pattern = [=[(?-i:(?:^|[^\w+/])rO0AB[A-Za-z0-9+/]{8}|(?:^|\W)aced0005[0-9a-f]{8})]=] },
+
+        -- XML external entities: an entity declaration or an internal DTD
+        -- subset. A plain <!DOCTYPE html ...> is not one.
+        { id = "xxe_entity", category = "xxe",
+          pattern = [=[<!entity\s++(?:%\s*+)?[\w.-]++\s++(?:system|public)\b|<!doctype\s++[\w:.-]++\s*+(?:\[|system\s)]=] },
+
         -- OS command injection: a shell separator followed by a command. Words
         -- that are also English ("cat", "sleep", "ping") only count with a
         -- typical argument; "&id=" in a URL is not "& id".
@@ -137,20 +160,6 @@ local SIGNATURES = (function()
           pattern = [=[\b(?:gopher|dict|tftp|netdoc|jar)://]=]
               .. [=[|\bhttps?://(?:0x[0-9a-f]++|0[0-7]++|\d{8,10})(?=[.:/]|$)]=] },
 
-        -- Exploits for known-vulnerable components: Log4Shell (also nested
-        -- ${${lower:j}ndi:...} forms), Shellshock, Struts/OGNL, Spring4Shell
-        -- and Java deserialization (case-sensitive base64/hex magic bytes).
-        { id = "log4shell", category = "rce",
-          pattern = [=[\$\{\s*+(?:jndi\s*+:|(?:lower|upper|env|sys|date|main|base64|ctx|k8s|docker|spring]=]
-              .. [=[|web|java|marker|bundle|sd|event)\s*+:|::-|\$\{)]=] },
-        { id = "shellshock", category = "rce",
-          pattern = [=[\(\s*+\)\s*+\{\s*+(?::|\w++\s*+\(\s*+\))\s*+;]=] },
-        { id = "ognl_injection", category = "rce",
-          pattern = [=[#_memberaccess\b|@java\.lang\.(?:runtime|processbuilder|system)\b|\bognl\.ognlcontext\b]=]
-              .. [=[|#context\[|\bclass\.module\.classloader\b]=] },
-        { id = "java_deserialization", category = "rce",
-          pattern = [=[(?-i:(?:^|[^\w+/])rO0AB[A-Za-z0-9+/]{8}|(?:^|\W)aced0005[0-9a-f]{8})]=] },
-
         -- Server-side template injection: arithmetic probes ({{7*7}}, ${7*7})
         -- and template-engine object access.
         { id = "ssti_probe", category = "ssti",
@@ -159,11 +168,6 @@ local SIGNATURES = (function()
           pattern = [=[\b__(?:class|mro|subclasses|globals|builtins|bases)__\b]=]
               .. [=[|\{\{[^{}]{0,80}?\b(?:config|self|request|lipsum|cycler|joiner|namespace|url_for]=]
               .. [=[|get_flashed_messages)\s*+[.\[|(]|<#assign\b|\bfreemarker\.template\.utility\b]=] },
-
-        -- XML external entities: an entity declaration or an internal DTD
-        -- subset. A plain <!DOCTYPE html ...> is not one.
-        { id = "xxe_entity", category = "xxe",
-          pattern = [=[<!entity\s++(?:%\s*+)?[\w.-]++\s++(?:system|public)\b|<!doctype\s++[\w:.-]++\s*+(?:\[|system\s)]=] },
 
         -- NoSQL (MongoDB) operator injection, as a JSON key ({"$ne": null})
         -- or a parameter name (user[$ne]=x); both are checked (check_name).
