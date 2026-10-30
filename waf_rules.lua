@@ -57,6 +57,14 @@ local SIGNATURES = (function()
               .. GAP .. "=" .. GAPP .. [=[['"]?\k<a>\b]=] },
         { id = "numeric_tautology", category = "sqli",
           pattern = [=[\b(?:or|and)]=] .. SEP .. [=[(?<b>\d++)]=] .. GAP .. "=" .. GAP .. [=[\k<b>\b]=] },
+        -- Blind extraction with a subquery as the condition. Needs a comparison
+        -- after the subquery (or "=(SELECT"), so "and (select one from the
+        -- list)" in prose doesn't count.
+        { id = "boolean_subquery", category = "sqli", -- 1 AND (SELECT ...)='a'   1 AND 1=(SELECT ...)
+          pattern = [=[(?:\b(?:and|or|xor|having|where)\b|&&|\|\|)]=] .. GAP .. [=[\(]=] .. GAP
+              .. [=[select\b.{0,250}?\)]=] .. GAP .. [=[(?:[=<>!]|\b(?:like|between|in|is)\b)]=]
+              .. [=[|\b(?:and|or|xor|having|where)\b]=] .. GAP .. [=[[\w'"]++]=] .. GAP .. [=[(?:[=<>]|!=)]=]
+              .. GAP .. [=[\(]=] .. GAP .. [=[select\b]=] },
         { id = "quote_comment", category = "sqli",
           pattern = [=['[\s)]*+(?:--|/\*|#\s*+$)|"[\s)]*+(?:--[\s;]*+$|/\*)]=] },
         { id = "mysql_versioned_comment", category = "sqli",

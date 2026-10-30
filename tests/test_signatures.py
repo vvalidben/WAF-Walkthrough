@@ -33,6 +33,9 @@ ATTACKS = {
     "') OR ('a'='a": "tautology",
     "'/**/or/**/1=1": "tautology",
     "1 OR 1=1": "numeric_tautology",
+    "1 AND (SELECT substring(password,1,1) FROM users WHERE id=1)='a'": "boolean_subquery",
+    "1 AND 1=(SELECT COUNT(*) FROM users)": "boolean_subquery",
+    "1 or (select length(database()))>5": "boolean_subquery",
     "admin'--": "quote_comment",
     "admin' #": "quote_comment",
     "/*!50000union*/": "mysql_versioned_comment",
@@ -150,6 +153,9 @@ BENIGN = [
     "I need to confirm (the order)", "set an alert for 5pm", "${price}", "the env: production",
     "dGhpcyBpcyBub3QgcjBPMEFCIGF0IGFsbA", "100.100.100.2", "ldap server settings",
     "CREATE TABLE `logs` (`id` int(6) unsigned)",
+    "Sizes S, M and (select one from the list)", "salt and (select a brand) pepper",
+    # the smoke test's ML-only attack must stay ML-only
+    "7 AND ASCII(SUBSTRING((SELECT password FROM users LIMIT 1),1,1))>77",
 ]
 
 # Inputs built to make backtracking regexes blow up; must stay linear.
