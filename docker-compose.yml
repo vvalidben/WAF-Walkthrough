@@ -22,6 +22,11 @@ services:
       WAF_READ_TIMEOUT_MS: ${WAF_READ_TIMEOUT_MS:-50}
       # Regex signatures checked before the model; a match blocks without an ML call.
       WAF_REGEX_MODE: ${WAF_REGEX_MODE:-block}            # block | monitor | off
+      # Signature categories to switch off if they misfire on your app, e.g. "nosqli,cmdi".
+      # sqli xss cmdi lfi ssrf rce ssti xxe nosqli crlf scanner
+      WAF_DISABLED_CATEGORIES: ${WAF_DISABLED_CATEGORIES:-}
+      # Lets the dashboard's "Flag false positive" button post to ml-api /feedback.
+      FEEDBACK_API_KEY: ${FEEDBACK_API_KEY:-}
       # Path/header/cookie inspection: monitor until checked against real traffic.
       WAF_EXTENDED_MODE: ${WAF_EXTENDED_MODE:-monitor}  # block | monitor | off
       WAF_EXTENDED_THRESHOLD: ${WAF_EXTENDED_THRESHOLD:-0.8}
@@ -49,6 +54,8 @@ services:
       - ./waf_interceptor.lua:/etc/openresty/waf/waf_interceptor.lua:ro
       - ./waf_target.lua:/etc/openresty/waf/waf_target.lua:ro
       - ./waf_admin.lua:/etc/openresty/waf/waf_admin.lua:ro
+      - ./waf_rules.lua:/etc/openresty/waf/waf_rules.lua:ro
+      - ./waf_dashboard.lua:/etc/openresty/waf/waf_dashboard.lua:ro
       - ./admin:/etc/openresty/waf/admin:ro
       # JSON access logs (json_waf), read by Alloy.
       - waf_logs:/var/log/waf

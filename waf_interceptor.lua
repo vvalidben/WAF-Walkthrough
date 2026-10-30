@@ -5,13 +5,18 @@ For each proxied request it collects input values from:
   parameters  URI arguments and the request body (form, multipart, JSON, text)
   extended    the URI path, selected headers (User-Agent, Referer) and cookies
 Hybrid engine:
-  1. regex  every value is first checked against a small table of
-            unmistakable SQLi signatures (SIGNATURES below). A match blocks the
-            request at once; the ML API is not called at all. This catches
+  1. regex  every value (and every parameter name and JSON key) is first
+            checked against a table of unmistakable attack signatures
+            (SIGNATURES in waf_rules.lua): SQLi, XSS, command injection, path traversal,
+            SSRF, known exploits (Log4Shell, ...), template injection, XXE,
+            NoSQL injection, CRLF and scanners. A match blocks the request at
+            once; the ML API is not called at all. For SQLi this also catches
             "good word" attacks, where a payload is padded with benign text
             (e.g. appended to a real User-Agent) to dilute the model's score.
-  2. ml     everything else is scored in ONE call to the ML API's /scan/batch
-            endpoint (values already scored recently come from a cache).
+  2. ml     everything else is scored for SQLi in ONE call to the ML API's
+            /scan/batch endpoint (values already scored recently come from a cache).
+
+Every decision records its attack category ($waf_category, alerts).
 
 Extended values use their own threshold and mode (WAF_EXTENDED_THRESHOLD,
 WAF_EXTENDED_MODE): the model was trained on parameter values, and ordinary
@@ -108,93 +113,12 @@ local function iso_now()
 end
 
 ---------------------------------------------------------------------------
--- Regex pre-filter: signature table
---
--- Only constructs that essentially never occur in legitimate input. Bare "--"
--- and "/*" are deliberately NOT signatures: "--" is in roughly 1 in 14 JWT
--- cookies (base64url), BEM CSS classes and CLI flags; "/*" in globs such as
--- src/**/*.js. Comment syntax only counts in SQL context (after a quote,
--- between SQL keywords, MySQL /*!...*/).
---
--- Matching is ReDoS-safe: possessive quantifiers (*+ ++) never backtrack, so
--- time stays linear in the input; lua_regex_match_limit (nginx.conf) is the
--- backstop. Patterns run case-insensitively ("i"), JIT-compiled once per
--- worker ("jo").
+-- Regex pre-filter: the signatures live in waf_rules.lua, shared with the
+-- admin dashboard, where single rules can be switched off at runtime.
 ---------------------------------------------------------------------------
 
--- signatures:begin
-local SIGNATURES = (function()
-    local COMMENT = [=[/\*(?:[^*]|\*(?!/))*+\*/]=]          -- /* ... */
-    local GAP = [=[(?:\s|]=] .. COMMENT .. [=[)*+]=]         -- optional whitespace or comments
-    local SEP = [=[(?:\s|]=] .. COMMENT .. [=[)++]=]         -- required whitespace or comments
-    local SEPP = [=[(?:\s|\(|]=] .. COMMENT .. [=[)++]=]     -- ... or "("
-    local GAPP = [=[(?:\s|[()]|]=] .. COMMENT .. [=[)*+]=]   -- optional whitespace, comments or brackets
-    local KEYWORD = [=[(?:or|and|union|select|from|where|having|order\s++by|group\s++by)]=]
-
-    return {
-        { id = "union_select",
-          pattern = [=[\bunion]=] .. SEPP .. [=[(?:(?:all|distinct)]=] .. SEPP .. [=[)?select\b]=] },
-        { id = "stacked_query",
-          pattern = ";" .. GAP .. [=[(?:drop]=] .. SEP .. [=[(?:table|database|schema)\b|truncate]=] .. SEP
-              .. [=[table\b|declare]=] .. SEP .. [=[@\w|exec(?:ute)?]=] .. SEP .. [=[(?:master\.|xp_|sp_))]=] },
-        { id = "dangerous_procedure",
-          pattern = [=[\b(?:xp_cmdshell|xp_regread|xp_dirtree|sp_oacreate|sp_makewebtask)\b]=] },
-        { id = "time_delay",
-          pattern = [=[\bwaitfor]=] .. SEP .. [=[delay]=] .. GAP .. [=['\d|\bbenchmark\s*+\(\s*+\d++\s*+,]=]
-              .. [=[|(?:\b(?:and|or|select|if|then|when)|[(,'"|+])]=] .. GAP .. [=[(?:pg_)?sleep\s*+\(\s*+\d]=] },
-        { id = "tautology", -- ' or '1'='1   ') OR ('a'='a   '/**/or/**/1=1
-          pattern = [=[['"]]=] .. GAPP .. [=[(?:or|\|\|)(?:]=] .. SEPP .. [=[|(?=['"\d]))['"]?(?<a>\w++)['"]?]=]
-              .. GAP .. "=" .. GAPP .. [=[['"]?\k<a>\b]=] },
-        { id = "numeric_tautology",
-          pattern = [=[\b(?:or|and)]=] .. SEP .. [=[(?<b>\d++)]=] .. GAP .. "=" .. GAP .. [=[\k<b>\b]=] },
-        { id = "quote_comment",
-          pattern = [=['[\s)]*+(?:--|/\*|#\s*+$)|"[\s)]*+(?:--[\s;]*+$|/\*)]=] },
-        { id = "mysql_versioned_comment",
-          pattern = [=[/\*!(?:\d{5}|\s*+(?:union|select|and|or|insert|update|delete)\b)]=] },
-        { id = "comment_obfuscation",
-          pattern = [=[\b]=] .. KEYWORD .. COMMENT .. [=[(?:\w|['"(@])]=] },
-        { id = "system_catalog",
-          pattern = [=[\b(?:information_schema|sqlite_master|pg_catalog|mysql\.user|sysobjects|syscolumns)\b]=]
-              .. [=[|@@(?:version|datadir|hostname|basedir)\b]=] },
-        { id = "file_access",
-          pattern = [=[\binto]=] .. SEP .. [=[(?:out|dump)file\b|\bload_file\s*+\(]=] },
-        { id = "error_based",
-          pattern = [=[\b(?:extractvalue|updatexml)\s*+\(|\bexp\s*+\(\s*+~|\bconvert\s*+\(\s*+int\s*+,]=] },
-        { id = "char_concat",
-          pattern = [=[\bchar\s*+\(\s*+\d++\s*+\)\s*+(?:\|\||\+|,\s*+char\b)]=] },
-    }
-end)()
--- signatures:end
-
--- All signatures in one alternation: a benign value (the common case) costs a
--- single scan. Only on a match are the signatures tried one by one to name it.
-local SIGNATURES_COMBINED
-do
-    local parts = {}
-    for i, signature in ipairs(SIGNATURES) do
-        parts[i] = "(?:" .. signature.pattern .. ")"
-    end
-    SIGNATURES_COMBINED = table.concat(parts, "|")
-end
-
--- Returns the first matching signature, or nil. A regex error (e.g. the match
--- limit) is logged and treated as "no match": the value then goes to the ML
--- model, so an error never skips inspection.
-local function match_signature(value)
-    local from, _, err = ngx.re.find(value, SIGNATURES_COMBINED, "joi")
-    if not from then
-        if err then
-            ngx.log(ngx.WARN, "WAF signature check failed, deferring to ML: ", err)
-        end
-        return nil
-    end
-    for _, signature in ipairs(SIGNATURES) do
-        if ngx.re.find(value, signature.pattern, "joi") then
-            return signature
-        end
-    end
-    return nil
-end
+local waf_rules = require "waf_rules"
+local match_signature = waf_rules.match
 
 ---------------------------------------------------------------------------
 -- Value extraction
@@ -256,6 +180,39 @@ local function label(kind, name)
     return kind .. ":" .. to_valid_utf8(name:sub(1, 64))
 end
 
+-- Check a value against the signatures only (no ML scoring). Values made only
+-- of letters, digits and "._~" can't carry any signature and skip the check.
+-- Returns true, or false and "signature_match" (WAF_REGEX_MODE=block).
+local function check_signatures(batch, value, source)
+    if CONFIG.regex_mode == "off" or not value:find("[^%w%._~]") then
+        return true
+    end
+    local signature = match_signature(value)
+    if signature then
+        if not batch.regex_hit then
+            batch.regex_hit = { signature = signature, source = source, value = value }
+        end
+        if CONFIG.regex_mode == "block" then
+            return false, "signature_match"
+        end
+        -- monitor: record the hit, and let the model score the value too
+    end
+    return true
+end
+
+-- Parameter names and JSON keys: signatures only. NoSQL operator injection
+-- lives there (user[$ne]=x, {"$where": ...}), and the model was trained on
+-- values, not names.
+local function check_name(batch, name, kind)
+    if type(name) ~= "string" then
+        return true
+    end
+    if #name > CONFIG.max_header_bytes then
+        return false, "too_many_items"
+    end
+    return check_signatures(batch, name, kind .. "-name")
+end
+
 -- Check a value against the signatures, then append it for the ML call,
 -- splitting long values into overlapping chunks (the model was trained on
 -- short parameter values).
@@ -285,19 +242,10 @@ local function add_value(batch, value, source, extended)
     end
 
     -- Pre-flight: the whole value, not chunks, so no signature is split
-    -- across a chunk boundary. Values made only of letters, digits and "._~"
-    -- can't contain SQL syntax and skip the check.
-    if CONFIG.regex_mode ~= "off" and value:find("[^%w%._~]") then
-        local signature = match_signature(value)
-        if signature then
-            if not batch.regex_hit then
-                batch.regex_hit = { signature = signature, source = source, value = value }
-            end
-            if CONFIG.regex_mode == "block" then
-                return false, "signature_match"
-            end
-            -- monitor: record the hit, and let the model score the value too
-        end
+    -- across a chunk boundary.
+    local ok, why = check_signatures(batch, value, source)
+    if not ok then
+        return false, why
     end
 
     repeat
@@ -325,8 +273,11 @@ local function add_json_strings(batch, node)
     if type(node) ~= "table" then
         return add_value(batch, node, "json", false)
     end
-    for _, child in pairs(node) do
-        local ok, why = add_json_strings(batch, child)
+    for key, child in pairs(node) do
+        local ok, why = check_name(batch, key, "json")
+        if ok then
+            ok, why = add_json_strings(batch, child)
+        end
         if not ok then
             return false, why
         end
@@ -374,7 +325,10 @@ local function add_args(batch, kind, extended, args, err)
         return false, "too_many_args"
     end
     for name, value in pairs(args or {}) do
-        local ok, why = add_value(batch, value, label(kind, name), extended)
+        local ok, why = check_name(batch, name, kind)
+        if ok then
+            ok, why = add_value(batch, value, label(kind, name), extended)
+        end
         if not ok then
             return false, why
         end
@@ -461,12 +415,14 @@ local function collect_path(batch)
             return false, why
         end
     end
-    -- Also the whole path: a payload with literal slashes (e.g. /**/ comments)
-    -- only reads as SQL in one piece.
+    -- Also the whole path: a payload with literal slashes (e.g. /**/ comments,
+    -- ../../ or /.git/config) only reads as an attack in one piece. With a
+    -- single segment that equals the segment for the model, but the leading
+    -- "/" still matters to the signatures (/.env).
     if segments > 1 then
         return add_value(batch, ngx.unescape_uri(raw_path), "path", true)
     end
-    return true
+    return check_signatures(batch, ngx.unescape_uri(raw_path), "path")
 end
 
 local function collect_headers(batch)
@@ -699,8 +655,9 @@ local function signature_decision(batch, action)
     local hit = batch.regex_hit
     return {
         action = action,
-        reason = "sqli_signature",
+        reason = hit.signature.category .. "_signature", -- sqli_signature, xss_signature, ...
         engine = "regex",
+        category = hit.signature.category,
         signature = hit.signature,
         source = hit.source,
         regex_value = hit.value,
@@ -792,6 +749,7 @@ local function inspect()
         action = action,
         reason = (#flagged > 0 and "sqli_detected") or err or reason,
         engine = "ml",
+        category = #flagged > 0 and "sqli" or nil, -- the model detects SQLi only
         score = top and probabilities[top],
         source = top and batch.labels[top],
         threshold = top and (batch.extended[top] and CONFIG.extended_threshold or CONFIG.block_threshold),
@@ -881,15 +839,18 @@ ngx.var.waf_score = decision.score and string.format("%.4f", decision.score) or 
 ngx.var.waf_source = decision.source or ""
 ngx.var.waf_engine = decision.engine or ""
 ngx.var.waf_signature = decision.signature and decision.signature.id or ""
+ngx.var.waf_category = decision.category or ""
 ngx.var.waf_items = tostring(decision.items or 0)
 ngx.var.waf_ml_items = tostring(decision.sent or 0)
 ngx.var.waf_latency_ms = decision.latency_ms and string.format("%.1f", decision.latency_ms) or ""
 ngx.var.waf_ml_request_id = decision.ml_request_id or ""
 
-if decision.reason == "sqli_detected" or decision.reason == "sqli_signature" then
+if decision.category then
     local signature = decision.signature
     fire_alert({
-        event = "sqli_detected",
+        -- "sqli_detected" kept for SQLi so existing alert consumers still match.
+        event = decision.category == "sqli" and "sqli_detected" or "attack_detected",
+        category = decision.category, -- sqli, xss, cmdi, lfi, ssrf, rce, ssti, xxe, nosqli, crlf, scanner
         action = decision.action,
         source_engine = decision.engine, -- "regex" or "ml"
         -- regex only: which signature matched (probability/threshold are then absent)

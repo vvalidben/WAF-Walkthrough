@@ -29,6 +29,7 @@ loki.process "waf" {
       waf_action    = "",
       waf_engine    = "",
       waf_signature = "",
+      waf_category  = "",
     }
   }
 
@@ -54,6 +55,7 @@ loki.process "waf" {
       status             = "",
       waf_action         = "",
       waf_engine         = "",
+      waf_category       = "",
       geoip_country_name = "",
     }
   }

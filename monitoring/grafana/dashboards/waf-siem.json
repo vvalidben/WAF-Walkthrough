@@ -322,6 +322,53 @@
       }
     },
     {
+      "id": 6,
+      "type": "piechart",
+      "title": "Attack types (blocks by category)",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "sum by (waf_category) (count_over_time({job=\"waf\", waf_action=\"block\", waf_category=~\".+\"} [$__range]))",
+          "queryType": "instant",
+          "legendFormat": "{{waf_category}}"
+        }
+      ],
+      "options": {
+        "pieType": "donut",
+        "displayLabels": [
+          "name",
+          "percent"
+        ],
+        "reduceOptions": {
+          "calcs": [],
+          "fields": "/^Value #A$/",
+          "values": true
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        }
+      }
+    },
+    {
       "id": 5,
       "type": "logs",
       "title": "Recent blocks",
@@ -329,7 +376,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 20
+        "y": 28
       },
       "datasource": {
         "type": "loki",

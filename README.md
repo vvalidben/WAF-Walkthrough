@@ -1,6 +1,6 @@
 # SQL Injection Detector
 
-A machine-learning Web Application Firewall for SQL injection. Character n-gram TF-IDF features feed a Random Forest, served by a FastAPI service. An OpenResty (NGINX + Lua) reverse proxy checks every request with a hybrid engine before it reaches your application: high-precision regex signatures first, then the ML model for everything the signatures don't match.
+A machine-learning Web Application Firewall, built around SQL injection and extended to the attack categories of the OWASP Top 10. Character n-gram TF-IDF features feed a Random Forest, served by a FastAPI service. An OpenResty (NGINX + Lua) reverse proxy checks every request with a hybrid engine before it reaches your application: high-precision regex signatures first (SQLi, XSS, command injection, path traversal, SSRF, Log4Shell and other known exploits, template injection, XXE, NoSQL injection, CRLF, scanners), then the ML model for any SQLi the signatures don't match. It also rate-limits login brute force and adds security headers. See [OWASP Top 10 coverage](#owasp-top-10-coverage).
 
 ```
 client --> openresty :8080 ---------------> backend_app (your application)
@@ -17,6 +17,8 @@ api.py         -> serves POST /scan, POST /scan/batch and GET /health
 Dockerfile, gunicorn.conf.py                          -> ML API container
 nginx.conf, waf_interceptor.lua, Dockerfile.openresty -> WAF proxy container
 waf_target.lua, waf_admin.lua, admin/                 -> admin page (127.0.0.1:8081): paste a URL to protect that site
+waf_dashboard.lua, admin/dashboard.*                  -> security dashboard (127.0.0.1:8081/dashboard): live traffic, threat feed, rules, test console
+waf_rules.lua                                         -> the regex signatures, switchable at runtime from the dashboard
 docker-compose.yml                                    -> WAF + ML API + placeholder backend
 loadtest.py                                           -> load test: inspection outcomes under concurrency
 monitoring/                                           -> Grafana Alloy, Loki and Grafana config + the "WAF SIEM" dashboard
@@ -225,6 +227,22 @@ What the page works out for you:
 
 The choice is saved on the `waf_config` volume and survives restarts. It overrides `.env` until you click **Go back to the site set in .env**. Target changes are logged to `docker compose logs openresty` ("WAF admin: now protecting …"). The page is published on `127.0.0.1` only (`WAF_ADMIN_PORT`, default 8081), and its API refuses requests with a foreign `Host` or `Origin` header, so a website open in your browser can't change the target. Anyone with a shell on this machine can, so don't publish port 8081 beyond localhost.
 
+### Security dashboard
+
+<http://127.0.0.1:8081/dashboard> (linked from the admin page) shows the WAF's own access log, with no extra services:
+
+| Screen | What it shows |
+|---|---|
+| Overview | Requests, blocks, monitor detections and hostile IPs over 24 h; requests per hour with the blocked share; top rules and top blocked IPs |
+| Threat feed | Every inspected request as it happens (refreshes every 3 s; requests with nothing to inspect are left out), filterable by blocked / monitored |
+| Request detail | One request: the value that triggered it with the matched fragment highlighted, every signature it matches, the ML score, the client. Buttons: replay in the console, switch the deciding rule off, or (ML decisions) flag a false positive, which posts the value to `ml-api /feedback` as safe (needs `FEEDBACK_API_KEY`) |
+| Rules | All 34 signatures by category with their 24 h hits. Switching one off applies to the next request (a version counter in the `waf_config` shared dict) and is saved to the `waf_config` volume. Categories in `WAF_DISABLED_CATEGORIES` show as locked |
+| Test console | A dry run of any value through the real signatures and the ML model. Nothing is sent to the protected site |
+
+- **Data source:** the hourly log files on the `waf_logs` volume (24 h), read by `waf_dashboard.lua`. The overview is cached for 5 seconds. The log keeps the URL and User-Agent but not bodies, cookies or other headers, so for those sources the dashboard names where the value was but can't show it.
+- **Security:** it has the admin page's protections (localhost only, foreign `Host`/`Origin` refused). Because it displays attacker-controlled payloads, it renders all data as text nodes and is served with a CSP that forbids inline script (`script-src 'self'`). The design's fonts load from Google Fonts.
+- **Signatures moved:** the `SIGNATURES` table now lives in `waf_rules.lua`, which both the WAF and the dashboard use.
+
 **Or set it in `.env`.** Set `WAF_BACKEND_URL` in `.env` instead of editing `nginx.conf`; the default is the placeholder. After changing it, run `docker compose up -d openresty`. This applies whenever no site is saved from the admin page.
 
 | Where your app runs | `.env` |
@@ -290,7 +308,7 @@ At the parameter threshold of 0.5, the WAF would block most Android browsers. Pa
 
 #### Hybrid engine: regex signatures before the model
 
-The model scores each value as one string, so a payload padded with benign text scores low (a "good word" attack). For example, `' OR 1=1--` appended to a real Android Chrome User-Agent scored 0.72, under the 0.8 header threshold. The WAF therefore checks every extracted value (parameters, bodies, path, headers, cookies, Referer parameters) against the `SIGNATURES` table in `waf_interceptor.lua` *before* the ML call:
+The model scores each value as one string, so a payload padded with benign text scores low (a "good word" attack). For example, `' OR 1=1--` appended to a real Android Chrome User-Agent scored 0.72, under the 0.8 header threshold. The WAF therefore checks every extracted value (parameters, bodies, path, headers, cookies, Referer parameters) against the `SIGNATURES` table in `waf_rules.lua` *before* the ML call:
 
 - **A match blocks the request immediately.** The value isn't added to the ML batch, and the ML API isn't called at all. The log shows `waf_engine: regex` and `waf_signature: <id>`, and the alert carries `source_engine: "regex"` plus the signature. Signature hits therefore don't depend on the ML API: they are blocked even when it is slow, down, or failing open.
 - **No match:** the value goes to the ML batch as before (`waf_engine: ml`).
@@ -334,7 +352,32 @@ If your application legitimately accepts SQL text in a parameter (a database con
 - `lua_regex_match_limit 100000` in `nginx.conf` is the backstop. If a match ever errors, the value is sent to the model instead of skipping inspection.
 - End to end, browser-like traffic (User-Agent, Referer, cookies including a JWT with `--`) ran at p50 12 ms / p95 16 ms per request, the same as before.
 
-**Adding a signature:** add an entry to `SIGNATURES`, using the `GAP`/`SEP` building blocks for whitespace and comments, and possessive quantifiers only. Test it against benign traffic from your own logs before deploying: a signature blocks without any score or threshold, so one false positive blocks every request that contains it. Then run `docker compose restart openresty`.
+**Adding a signature:** add an entry to `SIGNATURES` with an `id` and a `category`, using the `GAP`/`SEP` building blocks for whitespace and comments, and possessive quantifiers only. Test it against benign traffic from your own logs before deploying: a signature blocks without any score or threshold, so one false positive blocks every request that contains it. Then run `docker compose restart openresty`.
+
+#### OWASP Top 10 coverage
+
+The signatures table also covers attacks beyond SQLi. Every signature has a category, which is logged as `waf_category`, sent in alerts, and charted on the dashboard ("Attack types"). The ML model scores SQLi only; the other categories are signatures, so they block immediately without an ML call.
+
+A WAF stops attacks that arrive in requests. It can't fix flaws in your app's own logic, so some Top 10 (2025) categories are only partly or not at all within reach:
+
+| OWASP Top 10:2025 | What this WAF does | Category / where |
+|---|---|---|
+| A01 Broken Access Control | Path traversal (`../../`, encoded), sensitive-file probes (`/.env`, `/.git/`, `/etc/passwd`, `php://filter`), SSRF to cloud metadata and via `gopher://` or numeric-IP tricks. It can't tell whether user A may see user B's data. | `lfi`, `ssrf` |
+| A02 Security Misconfiguration | Adds `X-Content-Type-Options`, `Referrer-Policy` and `X-Frame-Options` when the app doesn't set them, and removes `X-Powered-By`. Blocks XXE (`<!ENTITY ... SYSTEM`, DTD subsets). | `nginx.conf`, `xxe` |
+| A03 Software Supply Chain Failures | Virtual patches for well-known exploits of vulnerable components: Log4Shell (including obfuscated `${${lower:j}ndi:`), Shellshock, Struts/OGNL, Spring4Shell, Java deserialization. Not a substitute for updating them. | `rce` |
+| A04 Cryptographic Failures | Not addressable by a WAF. | n/a |
+| A05 Injection | SQLi (signatures + ML), XSS, OS command injection, server-side template injection, NoSQL operator injection (also in JSON keys and `user[$ne]` parameter names), CRLF / response splitting. | `sqli`, `xss`, `cmdi`, `ssti`, `nosqli`, `crlf` |
+| A06 Insecure Design | Not addressable by a WAF. | n/a |
+| A07 Authentication Failures | Login brute force: POSTs to login, password, token and OTP paths are limited to 10 per minute per IP (burst 5), then answered 429. | `nginx.conf` (`waf_login`) |
+| A08 Software or Data Integrity Failures | Java deserialization payloads only. | `rce` |
+| A09 Security Logging and Alerting Failures | Every decision is logged (JSON, Loki, Grafana) and alerted (webhook / n8n). | section 7 |
+| A10 Mishandling of Exceptional Conditions | Requests that can't be fully inspected are rejected, and fail-open is budgeted per client (see *Decisions and fail-open*). | existing |
+
+Recon tools announcing themselves in the User-Agent (sqlmap, Nikto, Nmap NSE, ffuf, ...) are blocked too (`scanner`).
+
+**How the new signatures avoid false positives.** Ordinary formatting HTML (`<b>`, `<img src=...>`) isn't flagged; only script-capable tags, event handlers, script URLs and DOM sinks are. "JavaScript: The Good Parts", "Tom & Jerry", `?id=5&sort=price`, relative URLs like `a/../b`, `/.github/`, `{{ name }}` and plain localhost or private-network URLs all pass. English words that are also shell commands (`cat`, `sleep`, `ping`) only count with a typical argument. Measured against the 31,626 benign rows of `data/sqli.csv`, the new categories matched none. `tests/test_signatures.py` holds the attack and look-alike cases, and checks every pattern against backtracking blow-ups.
+
+**If a category misfires on your app**, switch it off with `WAF_DISABLED_CATEGORIES`, e.g. `WAF_DISABLED_CATEGORIES=nosqli` for an API that takes MongoDB-style filters such as `filters[price][$gte]=10` (Strapi), or `cmdi` for a site where users post shell commands. Then run `docker compose up -d openresty`.
 
 #### Verdict cache
 
@@ -424,7 +467,7 @@ OpenResty writes one JSON line per request (log format `json_waf`) both to stdou
  "waf_ml_request_id":"c9febaa1..."}
 ```
 
-`waf_engine` is `regex` when a signature decided the request (`waf_reason: sqli_signature`, `waf_signature` = the signature id, `ml_probability` empty, `waf_ml_items: 0`) and `ml` when the model did (`ml_probability` = the top score).
+`waf_engine` is `regex` when a signature decided the request (`waf_reason: <category>_signature`, e.g. `sqli_signature` or `xss_signature`, `waf_signature` = the signature id, `ml_probability` empty, `waf_ml_items: 0`) and `ml` when the model did (`ml_probability` = the top score). `waf_category` is the attack type of a block or monitor decision (`sqli`, `xss`, `cmdi`, `lfi`, `ssrf`, `rce`, `ssti`, `xxe`, `nosqli`, `crlf`, `scanner`), and empty otherwise. Alerts carry the same `category`; SQLi alerts keep `event: "sqli_detected"`, and the others use `event: "attack_detected"`. Login requests over the brute-force limit are logged with `status: 429` and an empty `waf_action`, because the limit applies before the WAF runs.
 
 **`request_uri` includes the query string**, so attack payloads are visible to analysts, but so is anything applications put in URLs: password-reset tokens, API keys, email addresses. Loki keeps logs for 30 days (`retention_period` in `monitoring/loki-config.yml`), and Grafana is published on localhost only, behind a password; see section 7. Values are JSON-escaped (`escape=json`), so attacker-controlled input can't break out of its field or forge extra log lines.
 
@@ -602,6 +645,7 @@ WAF (`openresty` service). Any new variable must also be declared with `env` in 
 | `WAF_ALERT_COOLDOWN_S` | `60` | Per-IP alert cooldown |
 | `WAF_BREAKER_SECONDS` | `5` | How long to skip an ML API that is down |
 | `WAF_REGEX_MODE` | `block` | Regex pre-filter: `block` (skip the ML call and answer 403), `monitor` or `off` |
+| `WAF_DISABLED_CATEGORIES` | (none) | Signature categories to switch off, comma-separated: `sqli xss cmdi lfi ssrf rce ssti xxe nosqli crlf scanner` |
 | `WAF_FAIL_OPEN_BUDGET` | `5` | Max fail-opens per client IP per window caused by timeouts or overload; beyond that, 503. `-1` = no limit |
 | `WAF_FAIL_OPEN_WINDOW_S` | `10` | Window for `WAF_FAIL_OPEN_BUDGET` |
 | `WAF_LOG_RETENTION_HOURS` | `24` | Hourly access-log files kept on the `waf_logs` volume |
@@ -684,7 +728,7 @@ Every distinct combination of Loki *labels* is a separate stream, and Loki allow
 
 | Labels (stream selectors) | Structured metadata |
 |---|---|
-| `job` (`waf`), `status`, `waf_action`, `waf_engine`, `geoip_country_name` | `client_ip`, `waf_signature`, `geoip_city_name`, `geoip_country_code`, `geoip_location_latitude`, `geoip_location_longitude` |
+| `job` (`waf`), `status`, `waf_action`, `waf_engine`, `waf_category`, `geoip_country_name` | `client_ip`, `waf_signature`, `geoip_city_name`, `geoip_country_code`, `geoip_location_latitude`, `geoip_location_longitude` |
 
 Anything else in the line (`request_uri`, `user_agent`, `ml_probability`, …) is available with `| json` at query time.
 
@@ -727,6 +771,7 @@ More useful queries:
 ```logql
 {job="waf", waf_engine="regex"} | waf_signature="union_select"                              # hits of one signature
 sum by (waf_signature) (count_over_time({job="waf", waf_engine="regex"} [$__range]))       # signature leaderboard
+sum by (waf_category) (count_over_time({job="waf", waf_action="block", waf_category=~".+"} [$__range]))  # attack types
 sum(rate({job="waf", waf_action="fail_open"} [5m]))                                        # fail-opens: alert on this
 {job="waf", waf_action="block"} | json | ml_probability != "" and ml_probability < 0.6     # borderline ML blocks
 ```
@@ -755,7 +800,7 @@ The tests don't need the datasets or a trained model: `tests/synthetic_data.py` 
 | `test_train.py` | Dataset cleaning; the ONNX export matches scikit-learn with 0 decision flips; the **fidelity gate rejects an export without the sublinear-TF fix** and writes no file; `ngram_range` not starting at 1 is refused |
 | `test_api.py` | `/scan` and `/scan/batch` against scikit-learn's scores; input validation without reflecting input; 503 for a missing model or one exported with other preprocessing; `/feedback` auth, de-duplication, CSV integrity and concurrent appends; micro-batching keeps results aligned and sheds requests that waited too long |
 | `test_n8n_workflows.py` | Runs the workflows' Code nodes with Node.js (`tests/n8n_code_node.js` stands in for n8n): attacker text is escaped in Slack, a genuine signed click round-trips the exact flagged value, and forged clicks are rejected (wrong secret, tampered body, stale timestamp, truncated signature, foreign `response_url`) |
-| `test_signatures.py` | The `SIGNATURES` block cut from `waf_interceptor.lua`, run by `resty` in the OpenResty image: 24 attacks hit the expected signature, 17 benign values (user agents, JWTs, names like O'Brien) hit none, and adversarial 100 KB inputs finish in under 250 ms (measured: 7 ms or less) |
+| `test_signatures.py` | The `SIGNATURES` block cut from `waf_rules.lua`, run by `resty` in the OpenResty image: 91 attacks hit the expected signature, 62 benign look-alikes (user agents, JWTs, URLs, names like O'Brien) hit none, and 14 adversarial inputs up to 100 KB finish in under 250 ms |
 
 `test_n8n_workflows.py` skips without Node.js and `test_signatures.py` without Docker.
 
