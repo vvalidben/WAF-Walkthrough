@@ -1,0 +1,9 @@
+# Runtime dependencies for the API container. The model is served as ONNX by
+# ONNX Runtime, so neither scikit-learn nor joblib (pickle) is needed here.
+numpy==2.5.4
+onnxruntime==1.31.1
+fastapi==0.162.0
+pydantic==2.14.1
+uvicorn[standard]==0.54.0
+uvicorn-worker==0.4.0
+gunicorn==26.2.0

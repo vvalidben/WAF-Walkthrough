@@ -1,0 +1,15 @@
+# Full development environment: training, tuning, ONNX export, data fetching
+# and the API (onnxruntime, from requirements-api.txt, also runs the export's
+# fidelity check).
+-r requirements-api.txt
+scikit-learn==1.9.1
+scipy==1.18.1
+joblib==1.6.0
+pandas==3.1.0
+requests==2.34.2
+skl2onnx==1.20.0
+onnx==1.23.2
+onnxconverter-common==1.16.0
+
+# Optional, only for `fetch_data.py --source kaggle`:
+# kaggle==2.2.5

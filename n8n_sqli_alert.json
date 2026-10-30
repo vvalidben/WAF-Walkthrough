@@ -1,0 +1,232 @@
+{
+  "name": "WAF SQLi Incident Response",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## WAF SQLi incident response\n\n**Setup after import**\n1. **WAF alert webhook**: create a *Header Auth* credential with name `Authorization` and value `Bearer <WAF_ALERT_WEBHOOK_TOKEN>`. Without it, anyone who finds the URL can post fake alerts.\n2. **AbuseIPDB lookup**: replace `YOUR_ABUSEIPDB_API_KEY` (better: move it into a Header Auth credential named `Key`).\n3. **Slack** nodes: pick a Slack credential (bot needs `chat:write`) and check the channel names.\n4. Publish/activate, then set the WAF's `WAF_ALERT_WEBHOOK_URL` to the production webhook URL.\n5. The \"Flag as false positive\" buttons need n8n_feedback_loop.json and Slack Interactivity (see README).\n\nRouting: AbuseIPDB score >= 50 goes to #security-incidents with @here; everything else (including failed lookups) goes to #security-alerts.",
+        "height": 360,
+        "width": 520
+      },
+      "id": "87f4800d-a3dd-49a1-a495-29f97512d429",
+      "name": "Setup notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -440
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "waf-sqli-alert",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "177ff957-880b-4066-9eea-e4153064c3b7",
+      "name": "WAF alert webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "ebeec14a-6668-444e-b501-d3f274fbbc94"
+    },
+    {
+      "parameters": {
+        "url": "https://api.abuseipdb.com/api/v2/check",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ipAddress",
+              "value": "={{ $json.body.ip }}"
+            },
+            {
+              "name": "maxAgeInDays",
+              "value": "90"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Key",
+              "value": "YOUR_ABUSEIPDB_API_KEY"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "1a79fd12-bf6b-4bdd-aa99-0cbf74c205c3",
+      "name": "AbuseIPDB lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        240,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge the WAF alert with the AbuseIPDB lookup and build the Slack messages.\n// Everything in the alert is attacker-controlled (payloads, paths, even the\n// host header), so it is escaped: unescaped, a payload containing <!channel>\n// would ping the whole channel, and <url|text> would render a disguised link.\nconst alert = $('WAF alert webhook').first().json.body ?? {};\nconst lookup = $input.first().json ?? {};\nconst intel = lookup.data ?? null; // AbuseIPDB \"data\" object; absent when the lookup failed\n\nconst RED = '#d40e0d';   // blocked\nconst AMBER = '#e8a317'; // detected in monitor mode (not blocked)\n// Slack caps a button's value at 2000 characters; an over-long value would\n// make Slack reject the whole message, so such values get no button.\nconst SLACK_BUTTON_VALUE_MAX = 2000;\n\nconst esc = (value, max = 300) => String(value ?? '')\n  .slice(0, max)\n  .replace(/&/g, '&amp;')\n  .replace(/</g, '&lt;')\n  .replace(/>/g, '&gt;')\n  .replace(/`/g, \"'\"); // a backtick in a payload would close the code block\n\nconst pct = (p) => (typeof p === 'number' ? `${(p * 100).toFixed(1)}%` : 'n/a');\nconst section = (text) => ({ type: 'section', text: { type: 'mrkdwn', text } });\n\nconst values = Array.isArray(alert.blocked_values) ? alert.blocked_values : [];\n// \"regex\": a WAF signature matched (no ML score); \"ml\": the model's score crossed the threshold.\nconst byRegex = alert.source_engine === 'regex';\nconst signatureId = esc(alert.signature?.id ?? 'unknown', 60);\n// -1 = unknown, so the threat check routes failed lookups to the standard channel.\nconst abuseScore = typeof intel?.abuseConfidenceScore === 'number' ? intel.abuseConfidenceScore : -1;\nconst lookupError = typeof lookup.error === 'string' ? lookup.error : lookup.error?.message;\nconst osint = intel\n  ? [\n      `*AbuseIPDB:* ${abuseScore}% abuse confidence, ${intel.totalReports ?? 0} reports from ${intel.numDistinctUsers ?? 0} users (last: ${esc(intel.lastReportedAt ?? 'never', 40)})`,\n      `*ISP:* ${esc(intel.isp, 100)} | *Usage:* ${esc(intel.usageType, 60)} | *Domain:* ${esc(intel.domain, 100)}`,\n      `*Country:* ${esc(intel.countryCode, 4)} | *Tor:* ${intel.isTor ? 'yes' : 'no'} | *Public IP:* ${intel.isPublic ? 'yes' : 'no'}`,\n    ].join('\\n')\n  : `_AbuseIPDB lookup failed: ${esc(lookupError ?? 'no data', 200)}_`;\n\n// One section per flagged value, each with its own \"Flag as false positive\"\n// button. The button value carries the original (unescaped) string, its\n// source and the WAF request_id to the feedback workflow (n8n_feedback_loop.json).\nfunction valueBlock(v, index) {\n  const why = byRegex ? `signature \\`${esc(v.signature ?? alert.signature?.id, 60)}\\`` : pct(v.probability);\n  const block = section(\n    `*${esc(v.source, 80)}* (${why})\\n\\`\\`\\`${esc(v.value ?? '[value not included]', 1000)}\\`\\`\\``,\n  );\n  // No button for signature hits: training data only changes the model, not\n  // the signature that blocked the value.\n  if (byRegex || typeof v.value !== 'string' || !v.value.trim()) return block;\n  const buttonValue = JSON.stringify({ v: 1, q: v.value, s: v.source ?? '', r: alert.request_id ?? '' });\n  if (buttonValue.length > SLACK_BUTTON_VALUE_MAX) return block;\n  block.accessory = {\n    type: 'button',\n    action_id: `waf_fp_${index}`,\n    text: { type: 'plain_text', text: 'Flag as false positive' },\n    value: buttonValue,\n    confirm: {\n      title: { type: 'plain_text', text: 'Mark this value as safe?' },\n      text: {\n        type: 'mrkdwn',\n        text: `The *${esc(v.source, 80)}* value will be added to the training data as safe (label 0). Only confirm legitimate traffic: marking a real attack safe teaches the model to let it through.`,\n      },\n      confirm: { type: 'plain_text', text: 'Mark safe' },\n      deny: { type: 'plain_text', text: 'Cancel' },\n    },\n  };\n  return block;\n}\n\nconst blocked = alert.action === 'block';\nconst outcome = blocked ? 'blocked' : 'detected (monitor mode, request was allowed)';\nconst blocks = [\n  section(`*SQL injection ${outcome}* on \\`${esc(alert.host, 100)}\\``),\n  {\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Request*\\n${esc(alert.method, 10)} ${esc(alert.path, 200)}` },\n      { type: 'mrkdwn', text: `*Source IP*\\n${esc(alert.ip, 45)}` },\n      byRegex\n        ? { type: 'mrkdwn', text: `*Detected by*\\nregex signature \\`${signatureId}\\` (no ML call)` }\n        : { type: 'mrkdwn', text: `*ML confidence*\\n${pct(alert.probability)} (threshold ${pct(alert.threshold)})` },\n      { type: 'mrkdwn', text: `*Flagged values*\\n${alert.flagged_count ?? values.length}, top: ${esc(alert.source, 80)}` },\n    ],\n  },\n  section(osint),\n  ...(values.length ? values.map(valueBlock) : [section('_no values included_')]),\n  ...(byRegex\n    ? [section(`_Blocked by a WAF signature. If this is a false positive, adjust the \\`${signatureId}\\` pattern in SIGNATURES in waf_interceptor.lua; the false-positive button only retrains the ML model._`)]\n    : []),\n  {\n    type: 'context',\n    elements: [{\n      type: 'mrkdwn',\n      text: `engine \\`${byRegex ? 'regex' : 'ml'}\\` | request_id \\`${esc(alert.request_id, 40)}\\` | ml_request_id \\`${esc(alert.ml_request_id ?? '-', 40)}\\` | ${esc(alert.ts, 30)}`,\n    }],\n  },\n];\n\n// Blocks go inside an attachment so the message gets a coloured bar, which\n// the feedback workflow turns green once a value is flagged as a false positive.\nconst summary = `SQL injection ${blocked ? 'blocked' : 'detected'} from ${esc(alert.ip, 45)} on ${esc(alert.host, 100)}`;\nconst message = (text, color) => JSON.stringify({ text, attachments: [{ color, blocks }] });\n\nreturn [{\n  json: {\n    ip: alert.ip ?? null,\n    request_id: alert.request_id ?? null,\n    action: alert.action ?? null,\n    probability: alert.probability ?? null,\n    abuse_score: abuseScore,\n    isp: intel?.isp ?? null,\n    country: intel?.countryCode ?? null,\n    // Top-level text shows above the attachment and is what notifications use;\n    // <!here> must be there (not inside the attachment) to notify.\n    slack_high: message(`<!here> :rotating_light: *High-threat source IP* (AbuseIPDB ${abuseScore}%): ${summary}`, RED),\n    slack_standard: message(`${blocked ? ':no_entry:' : ':warning:'} ${summary}`, blocked ? RED : AMBER),\n  },\n}];\n"
+      },
+      "id": "4ff51457-d0ea-4ed2-826f-ea3d8f39f20c",
+      "name": "Build alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "e393efea-6137-4dc1-af67-cc57d7fe60ef",
+              "leftValue": "={{ $json.abuse_score }}",
+              "rightValue": 50,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f0e235ea-d46d-4dd6-8d04-b590c16bb86a",
+      "name": "High-threat IP?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#security-incidents",
+          "mode": "name"
+        },
+        "messageType": "block",
+        "blocksUi": "={{ $json.slack_high }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "f947b810-d72b-45e6-8fea-18800d8fb037",
+      "name": "Slack: high-threat alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        960,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#security-alerts",
+          "mode": "name"
+        },
+        "messageType": "block",
+        "blocksUi": "={{ $json.slack_standard }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "177ff957-880b-4066-9eea-e4153064c3b8",
+      "name": "Slack: standard alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        960,
+        120
+      ]
+    }
+  ],
+  "connections": {
+    "WAF alert webhook": {
+      "main": [
+        [
+          {
+            "node": "AbuseIPDB lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AbuseIPDB lookup": {
+      "main": [
+        [
+          {
+            "node": "Build alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build alert": {
+      "main": [
+        [
+          {
+            "node": "High-threat IP?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High-threat IP?": {
+      "main": [
+        [
+          {
+            "node": "Slack: high-threat alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack: standard alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "tags": []
+}

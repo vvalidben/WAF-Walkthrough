@@ -1,0 +1,227 @@
+{
+  "name": "WAF False-Positive Feedback",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## WAF false-positive feedback (Slack button)\n\n**Setup after import**\n1. Slack app: *Interactivity & Shortcuts*, turn on, Request URL = this workflow's **production** webhook URL (see README).\n2. **Sign with Slack secret**: create a *Crypto* credential and paste the Slack app's **Signing Secret** into *Hmac Secret*.\n3. **Record in training data**: replace `YOUR_FEEDBACK_API_KEY` with the ML API's `FEEDBACK_API_KEY` (better: a Header Auth credential).\n4. n8n must reach `http://ml-api:8000`: attach the n8n container to the `sqli_feedback` Docker network.\n5. Optional: list allowed Slack user IDs in **Verify & parse click** (`ALLOWED_USER_IDS`).\n\nRequests with a missing, stale or wrong Slack signature fail in *Verify & parse click* and write nothing.",
+        "height": 380,
+        "width": 560
+      },
+      "id": "6a1f0c2e-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "name": "Setup notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -460
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "waf-slack-feedback",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "7b2a1d3f-4c5e-4f60-9b1c-1d2e3f4a5b6c",
+      "name": "Slack interactivity",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "8c3b2e4a-5d6f-4a71-8c2d-2e3f4a5b6c7d"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Slack signs every request: HMAC-SHA256 over \"v0:<timestamp>:<raw body>\"\n// with the app's signing secret. This node checks the timestamp and builds\n// that string from the exact raw bytes; the next node (Crypto) signs it with\n// the secret held in an n8n credential.\n// https://api.slack.com/authentication/verifying-requests-from-slack\nconst MAX_AGE_SECONDS = 300; // Slack's recommended replay window\n\nconst { headers, body } = $input.first().json;\nconst timestamp = String(headers['x-slack-request-timestamp'] ?? '');\nif (!/^\\d+$/.test(timestamp) || Math.abs(Date.now() / 1000 - Number(timestamp)) > MAX_AGE_SECONDS) {\n  throw new Error('Rejected: missing or stale Slack timestamp (possible replay)');\n}\n// Raw body as received (Webhook option \"Raw Body\"); re-encoding the parsed\n// form would not reproduce Slack's bytes exactly.\nconst rawBody = (await this.helpers.getBinaryDataBuffer(0, 'data')).toString('utf8');\n\nreturn [{\n  json: {\n    base_string: `v0:${timestamp}:${rawBody}`,\n    signature: String(headers['x-slack-signature'] ?? ''),\n    payload: String(body?.payload ?? ''),\n  },\n}];\n"
+      },
+      "id": "9d4c3f5b-6e7a-4b82-9d3e-3f4a5b6c7d8e",
+      "name": "Prepare signature check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "action": "hmac",
+        "type": "SHA256",
+        "value": "={{ $json.base_string }}",
+        "dataPropertyName": "expected_signature",
+        "encoding": "hex"
+      },
+      "id": "ae5d4a6c-7f8b-4c93-8e4f-4a5b6c7d8e9f",
+      "name": "Sign with Slack secret",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Accept the click only if Slack's signature matches. Slack can't send a\n// custom auth header, so without this check anyone who learns the webhook URL\n// could post fake clicks and write attack strings into the training data as\n// \"safe\", teaching the model to let them through.\n// Slack user IDs allowed to flag false positives, e.g. ['U012ABCDEF'];\n// empty = anyone who can see the alert channel.\nconst ALLOWED_USER_IDS = [];\n\nconst item = $input.first().json;\nconst expected = `v0=${item.expected_signature}`;\nconst given = item.signature;\n// Constant-time comparison (require('crypto') is disallowed in Code nodes).\nlet diff = expected.length ^ given.length;\nfor (let i = 0; i < expected.length; i++) {\n  diff |= expected.charCodeAt(i) ^ (given.charCodeAt(i) || 0);\n}\nif (diff !== 0) {\n  throw new Error('Rejected: invalid Slack signature');\n}\n\nconst payload = JSON.parse(item.payload || '{}');\nconst action = (payload.actions ?? []).find((a) => String(a.action_id ?? '').startsWith('waf_fp_'));\nif (payload.type !== 'block_actions' || !action) {\n  return []; // some other interaction: nothing to do\n}\nconst user = payload.user ?? {};\nif (ALLOWED_USER_IDS.length && !ALLOWED_USER_IDS.includes(user.id)) {\n  throw new Error(`Rejected: Slack user ${user.id} is not allowed to flag false positives`);\n}\nconst value = JSON.parse(action.value ?? '{}');\nif (typeof value.q !== 'string' || !value.q.trim()) {\n  throw new Error('Rejected: the button carries no value');\n}\n// The update is only ever posted back to Slack.\nif (!/^https:\\/\\/hooks\\.slack\\.com\\//.test(payload.response_url ?? '')) {\n  throw new Error('Rejected: unexpected response_url');\n}\n\nreturn [{\n  json: {\n    query: value.q,\n    label: 0,\n    source: String(value.s ?? '').slice(0, 100),\n    request_id: String(value.r ?? '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64),\n    flagged_by: `${user.username ?? user.name ?? 'unknown'} (${user.id ?? '?'})`.slice(0, 100),\n    user_id: user.id,\n    action_id: action.action_id,\n    response_url: payload.response_url,\n    message: payload.message ?? {},\n  },\n}];\n"
+      },
+      "id": "bf6e5b7d-8a9c-4da4-9f5a-5b6c7d8e9fa0",
+      "name": "Verify & parse click",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ml-api:8000/feedback",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_FEEDBACK_API_KEY"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.query, label: $json.label, source: $json.source, flagged_by: $json.flagged_by, request_id: $json.request_id }) }}",
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "c07f6c8e-9bad-4eb5-8a6b-6c7d8e9fa0b1",
+      "name": "Record in training data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        880,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Rebuild the alert: drop the clicked button, record who flagged the value,\n// and turn the colour bar green. If the ML API did not record it, say so and\n// keep the button so the click can be retried.\nconst flag = $('Verify & parse click').first().json;\nconst res = $input.first().json; // full HTTP response: statusCode, body (or error)\nconst recorded = res.statusCode === 201;\nconst duplicate = recorded && res.body?.status === 'duplicate';\n\nconst esc = (value, max = 100) => String(value ?? '')\n  .slice(0, max)\n  .replace(/&/g, '&amp;')\n  .replace(/</g, '&lt;')\n  .replace(/>/g, '&gt;');\n\nconst message = flag.message ?? {};\nconst attachment = message.attachments?.[0] ?? {};\nconst blocks = (attachment.blocks ?? message.blocks ?? []).map((block) => {\n  if (recorded && block.accessory?.action_id === flag.action_id) {\n    const { accessory, ...rest } = block;\n    return rest;\n  }\n  return block;\n});\n\nconst note = recorded\n  ? `:white_check_mark: Flagged as False Positive by <@${flag.user_id}>: the *${esc(flag.source)}* value ${duplicate ? 'was already in' : 'was added to'} the training data as safe.`\n  : `:x: <@${flag.user_id}> tried to flag the *${esc(flag.source)}* value as a false positive, but the ML API ${res.statusCode ? `answered HTTP ${res.statusCode}` : 'could not be reached'}. Not recorded; try again.`;\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: note }] });\n\nconst color = recorded ? '#2eb886' : `#${String(attachment.color ?? 'd40e0d').replace(/^#/, '')}`;\nreturn [{\n  json: {\n    response_url: flag.response_url,\n    update: {\n      replace_original: true,\n      text: message.text ?? 'SQL injection alert',\n      attachments: [{ color, blocks }],\n    },\n  },\n}];\n"
+      },
+      "id": "d1807d9f-acbe-4fc6-9b7c-7d8e9fa0b1c2",
+      "name": "Build message update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.response_url }}",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.update) }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "e2918ea0-bdcf-4ad7-8c8d-8e9fa0b1c2d3",
+      "name": "Update Slack message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1320,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Slack interactivity": {
+      "main": [
+        [
+          {
+            "node": "Prepare signature check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare signature check": {
+      "main": [
+        [
+          {
+            "node": "Sign with Slack secret",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign with Slack secret": {
+      "main": [
+        [
+          {
+            "node": "Verify & parse click",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify & parse click": {
+      "main": [
+        [
+          {
+            "node": "Record in training data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record in training data": {
+      "main": [
+        [
+          {
+            "node": "Build message update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build message update": {
+      "main": [
+        [
+          {
+            "node": "Update Slack message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "tags": []
+}

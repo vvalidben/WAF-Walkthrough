@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+
+# The official openresty/openresty:alpine image does not bundle lua-resty-http.
+# Install it with opm in the -fat variant (which has the tooling) and copy
+# just the library into the plain alpine image.
+ARG OPENRESTY_VERSION=1.29.2.5
+
+FROM openresty/openresty:${OPENRESTY_VERSION}-alpine-fat AS deps
+RUN opm get ledgetech/lua-resty-http=0.17.1
+
+FROM openresty/openresty:${OPENRESTY_VERSION}-alpine
+COPY --from=deps /usr/local/openresty/site/lualib/resty/ /usr/local/openresty/site/lualib/resty/
+
+# Access-log directory for the waf_logs volume: owned by the unprivileged
+# runtime user (nobody), so a fresh named volume inherits that ownership.
+RUN mkdir -p /var/log/waf && chown 65534:65534 /var/log/waf
+
+# nginx.conf and waf_interceptor.lua are bind-mounted read-only by
+# docker-compose.yml, so config changes only need `docker compose restart openresty`.
+EXPOSE 8080
+CMD ["/usr/local/openresty/bin/openresty", "-g", "daemon off;"]

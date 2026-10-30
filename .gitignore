@@ -1,0 +1,27 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets: copy .env.example to .env
+.env
+
+# Datasets (downloaded by fetch_data.py) and analyst feedback, which holds
+# real user input flagged by the WAF. Only the directory placeholders are kept.
+data/*
+!data/feedback/
+data/feedback/*
+!data/feedback/.gitkeep
+
+# Trained models: produced by train.py / tune.py
+models/*
+!models/.gitkeep
+!models/sqli_detector_optimized.onnx
+
+# MaxMind licence forbids redistributing the database
+GeoLite2-City.mmdb
+
+# Atomic-write leftovers (train.py, tune.py)
+*.tmp

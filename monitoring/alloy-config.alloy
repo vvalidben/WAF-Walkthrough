@@ -1,0 +1,86 @@
+// Grafana Alloy: ships the WAF's JSON access log to Loki, with a MaxMind
+// GeoIP lookup on every client IP. (Alloy replaces Promtail, which reached
+// end of life on 2 March 2026.)
+//
+// Source: hourly files written by OpenResty to the waf_logs volume,
+// mounted read-only at /var/log/waf.
+
+local.file_match "waf" {
+  path_targets = [{
+    "__path__" = "/var/log/waf/access-*.log",
+    "job"      = "waf",
+  }]
+  sync_period = "10s"
+}
+
+loki.source.file "waf" {
+  targets    = local.file_match.waf.targets
+  forward_to = [loki.process.waf.receiver]
+}
+
+loki.process "waf" {
+  forward_to = [loki.write.loki.receiver]
+
+  stage.json {
+    expressions = {
+      timestamp     = "",
+      client_ip     = "",
+      status        = "",
+      waf_action    = "",
+      waf_engine    = "",
+      waf_signature = "",
+    }
+  }
+
+  // Use the request's time from the log line, not the time Alloy read it.
+  stage.timestamp {
+    source = "timestamp"
+    format = "RFC3339"
+  }
+
+  // Adds geoip_city_name, geoip_country_name, geoip_country_code,
+  // geoip_location_latitude, geoip_location_longitude, ... to the extracted
+  // data. Private addresses (and anything not in the database) get none.
+  stage.geoip {
+    db      = "/etc/alloy/GeoLite2-City.mmdb"
+    source  = "client_ip"
+    db_type = "city"
+  }
+
+  // Labels: low-cardinality values only. Every distinct label combination is
+  // a separate Loki stream, and Loki allows 5000 streams per tenant by default.
+  stage.labels {
+    values = {
+      status             = "",
+      waf_action         = "",
+      waf_engine         = "",
+      geoip_country_name = "",
+    }
+  }
+
+  // loki.source.file labels every line with its file; one stream per hourly
+  // file is pointless here.
+  stage.label_drop {
+    values = ["filename"]
+  }
+
+  // High-cardinality values (one per IP, city or coordinate pair) as
+  // structured metadata: filterable and groupable in LogQL like labels,
+  // without creating streams.
+  stage.structured_metadata {
+    values = {
+      client_ip                = "",
+      waf_signature            = "",
+      geoip_city_name          = "",
+      geoip_country_code       = "",
+      geoip_location_latitude  = "",
+      geoip_location_longitude = "",
+    }
+  }
+}
+
+loki.write "loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

@@ -1,0 +1,235 @@
+# Traffic flow:  client -> openresty (WAF, :8080) -> backend_app
+#                                   \-> ml-api /scan/batch (internal network only)
+# Monitoring:     openresty -> waf_logs volume -> alloy (GeoIP) -> loki <- grafana (127.0.0.1:3000)
+
+services:
+  openresty:
+    build:
+      context: .
+      dockerfile: Dockerfile.openresty
+    image: sqli-waf-openresty:1.0.0
+    ports:
+      - "${WAF_PORT:-8080}:8080"
+    environment:
+      WAF_SCAN_URL: http://ml-api:8000/scan/batch
+      WAF_MODE: ${WAF_MODE:-block}                       # block | monitor
+      WAF_FAIL_MODE: ${WAF_FAIL_MODE:-open}              # open | closed
+      # Max fail-opens per client IP per 10 s caused by timeouts/overload (-1 = no limit).
+      WAF_FAIL_OPEN_BUDGET: ${WAF_FAIL_OPEN_BUDGET:-5}
+      WAF_BLOCK_THRESHOLD: ${WAF_BLOCK_THRESHOLD:-0.5}
+      WAF_READ_TIMEOUT_MS: ${WAF_READ_TIMEOUT_MS:-50}
+      # Regex signatures checked before the model; a match blocks without an ML call.
+      WAF_REGEX_MODE: ${WAF_REGEX_MODE:-block}            # block | monitor | off
+      # Path/header/cookie inspection: monitor until checked against real traffic.
+      WAF_EXTENDED_MODE: ${WAF_EXTENDED_MODE:-monitor}  # block | monitor | off
+      WAF_EXTENDED_THRESHOLD: ${WAF_EXTENDED_THRESHOLD:-0.8}
+      WAF_INSPECT_HEADERS: ${WAF_INSPECT_HEADERS:-user-agent,referer}
+      WAF_ALERT_WEBHOOK_URL: ${WAF_ALERT_WEBHOOK_URL:-}  # e.g. an n8n webhook URL
+      WAF_ALERT_WEBHOOK_TOKEN: ${WAF_ALERT_WEBHOOK_TOKEN:-}
+      WAF_ALERT_COOLDOWN_S: ${WAF_ALERT_COOLDOWN_S:-60}
+      # Alerts include the flagged values (cut to 256 chars). On a false positive
+      # that is a real user's input, possibly a password; set "false" to omit.
+      WAF_ALERT_INCLUDE_VALUES: ${WAF_ALERT_INCLUDE_VALUES:-true}
+      # Hourly access-log files kept on the waf_logs volume (Loki keeps the history).
+      WAF_LOG_RETENTION_HOURS: ${WAF_LOG_RETENTION_HOURS:-24}
+      # The protected app. Default: the placeholder backend_app. Point it at your
+      # own site in .env, e.g. http://host.docker.internal:3000 (an app on the
+      # host) or http://service-name:port (another compose service on the app network).
+      WAF_BACKEND_URL: ${WAF_BACKEND_URL:-http://backend_app:8080}
+      # For a remote HTTPS backend, its hostname (routing + SNI). Empty = pass the visitor's Host.
+      WAF_BACKEND_HOST: ${WAF_BACKEND_HOST:-}
+    # Lets the container reach apps running on the host via host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./waf_interceptor.lua:/etc/openresty/waf/waf_interceptor.lua:ro
+      # JSON access logs (json_waf), read by Alloy.
+      - waf_logs:/var/log/waf
+    networks:
+      - app
+      - ml
+    depends_on:
+      # Started, not healthy: the WAF fails open while the model loads.
+      - ml-api
+      - backend_app
+    user: "65534:65534"   # nobody; listens on unprivileged port 8080
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/waf/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  ml-api:
+    build: .
+    image: sqli-detector:1.0.0
+    # No published port: only the WAF can reach the model, over the internal network.
+    environment:
+      # ONNX export written by tune.py/train.py next to the .pkl.
+      SQLI_MODEL_PATH: /models/${SQLI_MODEL_FILE:-sqli_detector_optimized.onnx}
+      SQLI_THRESHOLD: ${SQLI_THRESHOLD:-0.5}
+      # Shed requests the WAF has already given up on (its timeout is 50 ms).
+      SQLI_MAX_QUEUE_MS: ${SQLI_MAX_QUEUE_MS:-40}
+      # Values scored per ONNX Runtime call. ONNX's cost per value grows with
+      # batch size (dense TF-IDF matrix), so small batches are fastest.
+      SQLI_MAX_BATCH_VALUES: ${SQLI_MAX_BATCH_VALUES:-16}
+      SQLI_ENABLE_DOCS: "false"
+      SQLI_LOG_PREVIEW: "false"
+      # Each worker scores one request at a time; size for peak traffic
+      # (roughly 80 req/s per worker with a 50-tree model).
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      # POST /feedback (Slack false-positive button via n8n). Unset = disabled.
+      FEEDBACK_API_KEY: ${FEEDBACK_API_KEY:-}
+      FEEDBACK_CSV_PATH: /feedback/custom_traffic.csv
+    volumes:
+      # Read-only: the container can load the model but never modify or replace it.
+      - ./models:/models:ro
+      # The only writable mount: reviewed labels for the next training run.
+      # Not ./data as a whole, so the API can't alter the main training set.
+      - ./data/feedback:/feedback
+    networks:
+      - ml
+      - feedback
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  # Placeholder for the protected application. Replace it with your own
+  # service (keep the name, or change $backend in nginx.conf).
+  backend_app:
+    image: hashicorp/http-echo:1.0.0
+    command: ["-listen=:8080", "-text=backend_app reached"]
+    networks:
+      - app
+    restart: unless-stopped
+
+  # --- Monitoring: Grafana Alloy -> Loki -> Grafana -------------------------
+
+  # Log shipper. Grafana Alloy rather than Promtail, which reached end of life
+  # on 2 March 2026 (no further fixes). Reads the access log read-only, looks
+  # up client IPs in MaxMind GeoLite2 and pushes to Loki.
+  alloy:
+    image: grafana/alloy:v1.21.3
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - --disable-reporting
+      - /etc/alloy/config.alloy
+    volumes:
+      - waf_logs:/var/log/waf:ro
+      - ./monitoring/alloy-config.alloy:/etc/alloy/config.alloy:ro
+      # Download it first (see README). create_host_path: false makes Docker
+      # Engine on Linux refuse to start without it; Docker Desktop (Windows,
+      # macOS) still creates an empty directory instead, and Alloy then fails
+      # with "invalid stage config no such device": delete that directory.
+      - type: bind
+        source: ./GeoLite2-City.mmdb
+        target: /etc/alloy/GeoLite2-City.mmdb
+        read_only: true
+        bind:
+          create_host_path: false
+      # Read positions, so a restart doesn't re-send or skip lines.
+      - alloy_data:/var/lib/alloy/data
+    networks:
+      - monitoring
+    depends_on:
+      - loki
+    # The image's own unprivileged user (it would otherwise run as root);
+    # owns /var/lib/alloy/data and can read the world-readable log files.
+    user: "473:473"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.7.9
+    command: ["-config.file=/etc/loki/config.yml"]
+    # No published port: only Alloy and Grafana reach it.
+    volumes:
+      - ./monitoring/loki-config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+    networks:
+      - monitoring
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.5
+    # Localhost only: the logs hold attack payloads, full URIs and client IPs.
+    # Put an authenticating reverse proxy (TLS, SSO) in front for remote access.
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD (e.g. in .env) - see README}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Use the plugins bundled in the image (incl. the Loki datasource) and
+      # never download or swap plugins at runtime. With a read-only root, the
+      # startup auto-update unregistered the bundled Loki plugin, then failed
+      # to replace it, leaving Grafana without a Loki datasource.
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_PLUGINS_PREINSTALL_AUTO_UPDATE: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      - monitoring
+    depends_on:
+      - loki
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+networks:
+  app: {}
+  ml:
+    # No route to the outside world; reachable only by the WAF.
+    internal: true
+  feedback:
+    # Lets n8n reach ml-api:8000/feedback without joining the WAF's network.
+    # Fixed name so n8n's own compose file can attach to it as an external network.
+    name: sqli_feedback
+    internal: true
+  # Alloy, Loki and Grafana only: no route to the application or the model.
+  # Not internal, so Grafana's port can be published.
+  monitoring: {}
+
+volumes:
+  waf_logs: {}
+  alloy_data: {}
+  loki_data: {}
+  grafana_data: {}

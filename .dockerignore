@@ -1,0 +1,11 @@
+# Only api.py, gunicorn.conf.py and requirements-api.txt are needed in the image.
+.venv/
+venv/
+__pycache__/
+*.pyc
+data/
+models/
+*.pkl
+*.csv
+.git/
+.env
