@@ -16,6 +16,8 @@ Security dashboard (admin/dashboard.*, data from waf_dashboard.lua):
   GET  /api/rules         every signature, its state and 24 h hits
   POST /api/rules         {"id": "...", "enabled": false} switch one signature
   POST /api/evaluate      {"payload": "..."} dry run of signatures + model
+  GET  /api/bans          active IP bans, the ban settings, the caller's IP
+  POST /api/bans          {"ip": "...", "action": "ban"|"unban", "minutes": 60}
   POST /api/false-positive {"id": "<request_id>"} send the value to the model's
                           training data as safe (needs FEEDBACK_API_KEY)
 
@@ -29,7 +31,14 @@ local http = require "resty.http"
 local target = require "waf_target"
 local dashboard = require "waf_dashboard"
 local waf_rules = require "waf_rules"
+local waf_bans = require "waf_bans"
 local cjson = dashboard.json
+
+-- An IPv4 or IPv6 address as nginx reports $remote_addr.
+local function valid_ip(ip)
+    return type(ip) == "string" and #ip <= 45
+        and (ip:match("^%d+%.%d+%.%d+%.%d+$") or ip:match("^[%x:.]+$") and ip:find(":", 1, true)) ~= nil
+end
 
 -- The WAF's own listener inside the container (nginx.conf).
 local WAF_URL = "http://127.0.0.1:8080"
@@ -108,7 +117,13 @@ if method == "GET" then
     elseif uri == "/api/overview" then
         local overview = dashboard.overview()
         overview.rule_hits = nil
+        for _, ip in ipairs(overview.top_ips) do
+            ip.banned = waf_bans.banned(ip.ip) ~= nil
+        end
         return reply(200, overview)
+    elseif uri == "/api/bans" then
+        return reply(200, { bans = setmetatable(waf_bans.list(), cjson.array_mt), settings = waf_bans.settings(),
+                            your_ip = ngx.var.remote_addr })
     elseif uri == "/api/feed" then
         return reply(200, { events = dashboard.feed(ngx.var.arg_limit) })
     elseif uri == "/api/event" then
@@ -189,6 +204,28 @@ if uri == "/api/rules" then
         rules.warning = "Applied, but couldn't be saved (" .. tostring(err) .. "), so it resets when the WAF restarts."
     end
     return reply(200, rules)
+end
+
+if uri == "/api/bans" then
+    if not valid_ip(body.ip) or (body.action ~= "ban" and body.action ~= "unban") then
+        return reply(400, { error = 'expected {"ip": "<address>", "action": "ban" | "unban"}' })
+    end
+    if body.action == "unban" then
+        local was = waf_bans.unban(body.ip)
+        return reply(200, { ip = body.ip, unbanned = was })
+    end
+    if waf_bans.allowlisted(body.ip) then
+        return reply(409, { error = body.ip .. " is on the allowlist (loopback or WAF_BAN_ALLOWLIST) and can't be banned." })
+    end
+    local minutes = tonumber(body.minutes) or math.floor(waf_bans.settings().duration / 60)
+    if minutes < 1 or minutes > 10080 then
+        return reply(400, { error = "minutes must be between 1 and 10080 (one week)" })
+    end
+    local record = waf_bans.ban(body.ip, { by = "dashboard" }, math.floor(minutes * 60))
+    if not record then
+        return reply(500, { error = "The ban couldn't be stored." })
+    end
+    return reply(200, record)
 end
 
 if uri == "/api/evaluate" then

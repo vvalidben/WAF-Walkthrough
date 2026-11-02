@@ -19,6 +19,7 @@ nginx.conf, waf_interceptor.lua, Dockerfile.openresty -> WAF proxy container
 waf_target.lua, waf_admin.lua, admin/                 -> admin page (127.0.0.1:8081): paste a URL to protect that site
 waf_dashboard.lua, admin/dashboard.*                  -> security dashboard (127.0.0.1:8081/dashboard): live traffic, threat feed, rules, test console
 waf_rules.lua                                         -> the regex signatures, switchable at runtime from the dashboard
+waf_bans.lua                                          -> automatic IP bans (20 blocks in 10 min -> 1 h), managed on the dashboard
 docker-compose.yml                                    -> WAF + ML API + placeholder backend
 loadtest.py                                           -> load test: inspection outcomes under concurrency
 monitoring/                                           -> Grafana Alloy, Loki and Grafana config + the "WAF SIEM" dashboard
@@ -65,6 +66,8 @@ O'Brien,0
 ```
 
 When the same query appears in both, **your labels override the public dataset**. The public datasets don't look much like real application input: their benign rows are mostly names and addresses, and their attacks are mostly scanner-generated. Benign inputs from your own logs, especially ones containing quotes, SQL keywords or punctuation, are the single most effective way to cut false positives.
+
+`generate_benign_corpus.py` writes a realistic starter set of such rows (short legitimate phrases that mix everyday words with SQL tokens — `C++ and C# tutorials`, `price > 100 and rating >= 4`, `1 or 2 items per customer` — plus reinforcing blind-SQLi attacks). On the public data alone the model blocks those phrases; retrained with this corpus it passes them (0.10–0.35) and still catches attacks. Replace it with your own traffic when you have it.
 
 ### Training CSV format
 
@@ -227,6 +230,16 @@ What the page works out for you:
 
 The choice is saved on the `waf_config` volume and survives restarts. It overrides `.env` until you click **Go back to the site set in .env**. Target changes are logged to `docker compose logs openresty` ("WAF admin: now protecting …"). The page is published on `127.0.0.1` only (`WAF_ADMIN_PORT`, default 8081), and its API refuses requests with a foreign `Host` or `Origin` header, so a website open in your browser can't change the target. Anyone with a shell on this machine can, so don't publish port 8081 beyond localhost.
 
+### Automatic IP bans
+
+A client that keeps attacking is cut off: `WAF_BAN_THRESHOLD` (20) blocked requests within `WAF_BAN_WINDOW_S` (10 minutes) ban its IP for `WAF_BAN_DURATION_S` (1 hour). A banned IP gets the same 403 as a block, logged as `waf_action: banned`, without inspection or an ML call, so a flood from it costs almost nothing. `waf_bans.lua` keeps bans and per-IP counters in the `waf_bans` shared dict: every worker sees a ban at once, and bans expire by themselves.
+
+- **Manage them on the dashboard.** The Overview lists active bans with an **Unban** button, the sidebar counts them, and a request's detail page offers **Ban this IP** or **Unban**. API: `GET/POST /api/bans`.
+- **Never banned:** loopback, plus anything in `WAF_BAN_ALLOWLIST`. The admin page stays reachable from a banned IP, so you can always unban yourself.
+- **Counted:** only `block` decisions. Monitor mode, rejects and fail-opens never ban anyone.
+- **Not persisted:** a WAF restart clears all bans and counters.
+- **Locally, all your test traffic has one IP** (Docker's gateway, e.g. 172.29.0.1). Twenty test attacks within 10 minutes will ban you from your own site; unban yourself on the dashboard. **Behind a load balancer or CDN**, configure `real_ip` (section 7) first, or the balancer's address gets banned and every visitor with it.
+
 ### Security dashboard
 
 <http://127.0.0.1:8081/dashboard> (linked from the admin page) shows the WAF's own access log, with no extra services:
@@ -322,6 +335,8 @@ The model scores each value as one string, so a payload padded with benign text 
 | `time_delay` | `WAITFOR DELAY '0:0:5'`, `BENCHMARK(5000000,`, `AND SLEEP(5)`, `pg_sleep(` |
 | `tautology` | `' OR '1'='1`, `') OR ('a'='a`, `'/**/or/**/1=1` |
 | `numeric_tautology` | `OR 1=1`, `AND 2=2` |
+| `boolean_subquery` | `AND (SELECT …)='a'`, `AND 1=(SELECT …)` — a subquery used as a condition |
+| `blind_extraction` | `ASCII(SUBSTRING((SELECT password …),1,1))`, `LENGTH((SELECT …))` — a subquery read one character at a time |
 | `quote_comment` | `admin'--`, `x')/*`, `1'#` at the end of a value |
 | `mysql_versioned_comment` | `/*!50000UNION*/`, `/*! SELECT` |
 | `comment_obfuscation` | `OR/**/1`, `SELECT/**/password` |
@@ -396,6 +411,7 @@ Each request gets exactly one of these outcomes, logged as `waf_action`:
 | `block` | A value matched a regex signature (`waf_engine: regex`), or a parameter value scored `>= WAF_BLOCK_THRESHOLD`, or (with `WAF_EXTENDED_MODE=block`) a path, header or cookie value scored `>= WAF_EXTENDED_THRESHOLD` (`waf_engine: ml`) | 403 |
 | `monitor` | Would have been blocked or rejected, but monitor mode applies (`WAF_MODE=monitor`, or an extended value with `WAF_EXTENDED_MODE=monitor`) | proxied |
 | `reject` | Request too large or complex to inspect fully | 403 |
+| `banned` | The client IP is banned (see *Automatic IP bans*); not inspected | 403 |
 | `fail_open` | ML API timed out (`WAF_READ_TIMEOUT_MS`, default 50 ms), returned 503, was unreachable, or the circuit breaker is open | proxied, error logged |
 | `fail_closed` | Same failures, with `WAF_FAIL_MODE=closed` | 503 |
 
@@ -646,6 +662,10 @@ WAF (`openresty` service). Any new variable must also be declared with `env` in 
 | `WAF_BREAKER_SECONDS` | `5` | How long to skip an ML API that is down |
 | `WAF_REGEX_MODE` | `block` | Regex pre-filter: `block` (skip the ML call and answer 403), `monitor` or `off` |
 | `WAF_DISABLED_CATEGORIES` | (none) | Signature categories to switch off, comma-separated: `sqli xss cmdi lfi ssrf rce ssti xxe nosqli crlf scanner` |
+| `WAF_BAN_THRESHOLD` | `20` | Blocked requests within the window that ban an IP; `0` disables automatic bans |
+| `WAF_BAN_WINDOW_S` | `600` | Window for counting blocked requests per IP |
+| `WAF_BAN_DURATION_S` | `3600` | How long a ban lasts |
+| `WAF_BAN_ALLOWLIST` | (none) | Comma-separated IPs that are never banned (loopback always is exempt) |
 | `WAF_FAIL_OPEN_BUDGET` | `5` | Max fail-opens per client IP per window caused by timeouts or overload; beyond that, 503. `-1` = no limit |
 | `WAF_FAIL_OPEN_WINDOW_S` | `10` | Window for `WAF_FAIL_OPEN_BUDGET` |
 | `WAF_LOG_RETENTION_HOURS` | `24` | Hourly access-log files kept on the `waf_logs` volume |

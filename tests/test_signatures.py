@@ -36,6 +36,13 @@ ATTACKS = {
     "1 AND (SELECT substring(password,1,1) FROM users WHERE id=1)='a'": "boolean_subquery",
     "1 AND 1=(SELECT COUNT(*) FROM users)": "boolean_subquery",
     "1 or (select length(database()))>5": "boolean_subquery",
+    "1 AND ASCII(SUBSTRING((SELECT password FROM users),1,1))>77": "blind_extraction",
+    "1 AND ASCII(SUBSTR((SELECT pw FROM u LIMIT 1),1,1))=97": "blind_extraction",
+    "1 AND ORD(MID((SELECT email FROM members),1,1))>64": "blind_extraction",
+    "1' AND IF((SELECT SUBSTRING(pw,1,1) FROM u)='a',SLEEP(3),0)--": "blind_extraction",
+    "x AND LENGTH((SELECT secret FROM accounts LIMIT 1))>10": "blind_extraction",
+    # good-word padding must not hide the blind-extraction signature
+    "great product fast shipping " * 20 + " AND ASCII(SUBSTRING((SELECT pw FROM u),1,1))>77": "blind_extraction",
     "admin'--": "quote_comment",
     "admin' #": "quote_comment",
     "/*!50000union*/": "mysql_versioned_comment",
@@ -154,8 +161,12 @@ BENIGN = [
     "dGhpcyBpcyBub3QgcjBPMEFCIGF0IGFsbA", "100.100.100.2", "ldap server settings",
     "CREATE TABLE `logs` (`id` int(6) unsigned)",
     "Sizes S, M and (select one from the list)", "salt and (select a brand) pepper",
-    # the smoke test's ML-only attack must stay ML-only
-    "7 AND ASCII(SUBSTRING((SELECT password FROM users LIMIT 1),1,1))>77",
+    # blind_extraction look-alikes: SQL-ish function words without a nested subquery
+    "count the items in your cart", "the left side of the page", "right and left shoes",
+    "please select your size from the menu", "concat your first and last name",
+    "length and width in cm", "lower or upper case letters", "cast your vote now",
+    # the smoke test's ML-only attack must match no signature (ML scores it)
+    "7 AND UNICODE(SUBSTRING(username,1,1))>100",
 ]
 
 # Inputs built to make backtracking regexes blow up; must stay linear.

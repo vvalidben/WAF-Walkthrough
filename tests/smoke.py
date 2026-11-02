@@ -24,7 +24,7 @@ import urllib.request
 
 REGEX_ATTACK = "1 UNION SELECT username, password FROM users"
 # No WAF signature matches this, so only the model can block it.
-ML_ATTACK = "7 AND ASCII(SUBSTRING((SELECT password FROM users LIMIT 1),1,1))>77"
+ML_ATTACK = "7 AND UNICODE(SUBSTRING(username,1,1))>100"
 BACKEND_TEXT = "backend_app reached"
 
 
@@ -86,6 +86,11 @@ def main() -> int:
     base = args.url.rstrip("/")
 
     wait_until("the WAF", lambda: request(f"{base}/waf/healthz")[0] == 200, args.timeout)
+    # This test sends many attacks from one IP: start from a clean ban counter
+    # (a ban left by an earlier run would turn every check into a 403).
+    admin = args.admin_url.rstrip("/")
+    my_ip = json.loads(request(f"{admin}/api/bans")[1])["your_ip"]
+    request(f"{admin}/api/bans", "POST", {"ip": my_ip, "action": "unban"})
     # The WAF fails open while the model loads, so wait until the ML path blocks.
     wait_until("the ML-only attack to be blocked (model still loading, or the WAF is not blocking)",
                lambda: get(base, ML_ATTACK)[0] == 403, args.timeout)
@@ -147,7 +152,6 @@ def main() -> int:
         failures.append("login rate limit")
 
     # Admin page: switching the protected site. Restores whatever was set before.
-    admin = args.admin_url.rstrip("/")
     before = json.loads(request(f"{admin}/api/target")[1])
     expect("admin page is served", request(f"{admin}/"), 200, backend=False)
     expect("admin rejects a non-http address", request(f"{admin}/api/target", "POST", {"url": "ftp://x.test"}), 400)
@@ -206,6 +210,34 @@ def main() -> int:
     print(f"{'ok  ' if ok else 'FAIL'} dashboard test console dry run ({verdicts})")
     if not ok:
         failures.append("dashboard evaluate")
+
+    # Automatic IP ban: THRESHOLD blocked requests ban this client; a harmless
+    # request is then refused without inspection; unbanning lets it through.
+    settings = json.loads(request(f"{admin}/api/bans")[1])["settings"]
+    if settings["enabled"]:
+        request(f"{admin}/api/bans", "POST", {"ip": my_ip, "action": "unban"})
+        attack_codes = {get(base, REGEX_ATTACK)[0] for _ in range(settings["threshold"])}
+        banned_code, banned_body = get(base, "red shoes")
+        bans = json.loads(request(f"{admin}/api/bans")[1])["bans"]
+        ok = attack_codes == {403} and banned_code == 403 and any(b["ip"] == my_ip and b["by"] == "auto" for b in bans)
+        print(f"{'ok  ' if ok else 'FAIL'} {settings['threshold']} blocked requests ban the client "
+              f"(benign request after: HTTP {banned_code})")
+        if not ok:
+            failures.append("auto ban")
+        banned_id = json.loads(banned_body).get("request_id") if banned_code == 403 else None
+        request(f"{admin}/api/bans", "POST", {"ip": my_ip, "action": "unban"})
+        expect("unbanning lets the client through again", get(base, "red shoes"), 200)
+        if args.compose_logs and banned_id:
+            time.sleep(1)
+            got = log_entries_by_request_id().get(banned_id, {}).get("waf_action")
+            ok = got == "banned"
+            print(f"{'ok  ' if ok else 'FAIL'} access log records the refused request as 'banned' (got {got!r})")
+            if not ok:
+                failures.append("ban log")
+    code, _ = request(f"{admin}/api/bans", "POST", {"ip": "127.0.0.1", "action": "ban"})
+    print(f"{'ok  ' if code == 409 else 'FAIL'} loopback can't be banned (HTTP {code})")
+    if code != 409:
+        failures.append("ban allowlist")
 
     if before.get("source") == "admin":
         request(f"{admin}/api/target", "POST", {"url": before["url"], "force": True})

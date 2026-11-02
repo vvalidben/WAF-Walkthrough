@@ -19,6 +19,7 @@ URL, the path and the User-Agent (payload_of).
 local cjson = require("cjson.safe").new()
 local http = require "resty.http"
 local waf_rules = require "waf_rules"
+local waf_bans = require "waf_bans"
 
 local _M = {}
 
@@ -32,7 +33,8 @@ local OVERVIEW_TTL = 5       -- seconds the overview is cached for
 -- overview cache's round trip as [] rather than {}.
 cjson.decode_array_with_array_mt(true)
 
-local BLOCKED = { block = true, reject = true, fail_closed = true }
+-- Refused requests. "banned" = the IP was banned (waf_bans.lua): no inspection.
+local BLOCKED = { block = true, reject = true, fail_closed = true, banned = true }
 
 local function env_number(name, default)
     return tonumber(os.getenv(name) or "") or default
@@ -350,6 +352,9 @@ function _M.event(id)
 
     local event = shape(found)
     event.ip_blocked_24h = ip_count
+    event.ban = waf_bans.banned(event.ip)
+    event.ban_allowlisted = waf_bans.allowlisted(event.ip)
+    event.ban_strikes = waf_bans.strikes(event.ip)
     event.hits = event.payload and spans(event.payload) or setmetatable({}, cjson.array_mt)
     event.settings = settings()
     return event
@@ -376,6 +381,8 @@ function _M.status()
     local rules = _M.rules()
     local s = rules.settings
     s.rules_on, s.rules_total = rules.on, rules.total
+    s.bans = waf_bans.settings()
+    s.bans.active = #waf_bans.list()
     return s
 end
 

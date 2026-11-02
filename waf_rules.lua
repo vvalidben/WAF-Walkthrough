@@ -65,6 +65,16 @@ local SIGNATURES = (function()
               .. [=[select\b.{0,250}?\)]=] .. GAP .. [=[(?:[=<>!]|\b(?:like|between|in|is)\b)]=]
               .. [=[|\b(?:and|or|xor|having|where)\b]=] .. GAP .. [=[[\w'"]++]=] .. GAP .. [=[(?:[=<>]|!=)]=]
               .. GAP .. [=[\(]=] .. GAP .. [=[select\b]=] },
+        -- Blind extraction: a SQL function reading a nested subquery, e.g.
+        -- ASCII(SUBSTRING((SELECT password FROM users),1,1)). This is the blind
+        -- form the model scores only ~0.55 and that padding dilutes, so a
+        -- signature is needed. A nested "(select" inside a data function never
+        -- occurs in legitimate input; benign "left (select one option...)" has
+        -- no second "(select".
+        { id = "blind_extraction", category = "sqli",
+          pattern = [=[\b(?:ascii|ord|hex|unhex|bin|substr(?:ing)?|mid|left|right|char_length|length|lower|upper]=]
+              .. [=[|concat(?:_ws)?|group_concat|count|sum|avg|floor|cast|convert|nullif|coalesce|elt|field]=]
+              .. [=[|make_set|json_extract|if|iif|nullif)\s*+\([^;'"`]{0,120}?\(\s*+select\b]=] },
         { id = "quote_comment", category = "sqli",
           pattern = [=['[\s)]*+(?:--|/\*|#\s*+$)|"[\s)]*+(?:--[\s;]*+$|/\*)]=] },
         { id = "mysql_versioned_comment", category = "sqli",

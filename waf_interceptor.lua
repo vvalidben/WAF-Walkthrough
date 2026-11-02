@@ -29,6 +29,7 @@ Outcomes, recorded in $waf_action (JSON access log):
   block        SQLi detected by a signature or the model, answered 403
   monitor      SQLi detected (or not inspectable) but in monitor mode, allowed
   reject       request could not be fully inspected (too many/too large values), 403
+  banned       client IP is banned (waf_bans.lua), 403 without inspection
   fail_open    ML API slow/unreachable/erroring, allowed (WAF_FAIL_MODE=open)
   fail_closed  ML API slow/unreachable/erroring, 503 (WAF_FAIL_MODE=closed)
 
@@ -812,6 +813,16 @@ local function fail_open_allowed(reason)
     return count == nil or count <= CONFIG.fail_open_budget
 end
 
+-- Banned IPs (waf_bans.lua) are refused before any inspection or ML call.
+local waf_bans = require "waf_bans"
+if waf_bans.banned(ngx.var.remote_addr) then
+    ngx.var.waf_action = "banned"
+    ngx.var.waf_reason = "ip_banned"
+    ngx.var.waf_items = "0"
+    ngx.var.waf_ml_items = "0"
+    return respond_json(ngx.HTTP_FORBIDDEN, { error = "forbidden", request_id = ngx.var.request_id })
+end
+
 local ok, decision = pcall(inspect)
 if not ok then
     ngx.log(ngx.ERR, "WAF internal error: ", decision)
@@ -871,6 +882,9 @@ if decision.category then
 end
 
 if decision.action == "block" or decision.action == "reject" then
+    if decision.action == "block" then
+        waf_bans.record_block(ngx.var.remote_addr, decision.category)
+    end
     return respond_json(ngx.HTTP_FORBIDDEN, { error = "forbidden", request_id = ngx.var.request_id })
 end
 if decision.action == "fail_closed" then

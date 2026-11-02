@@ -114,6 +114,7 @@ button { font-family: var(--mono); }
 .list-row:last-child { border-bottom: 0; }
 .rule-row { grid-template-columns: 64px minmax(0, 1fr) 52px; }
 .ip-row { grid-template-columns: minmax(0, 1fr) auto 44px; }
+.ban-row { grid-template-columns: minmax(0, 1fr) auto auto; }
 .meter { height: 3px; background: #14212a; }
 .meter > div { height: 100%; background: var(--green); box-shadow: 0 0 6px var(--green); }
 .num { text-align: right; font-variant-numeric: tabular-nums; }

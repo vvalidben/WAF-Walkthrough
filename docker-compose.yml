@@ -25,6 +25,12 @@ services:
       # Signature categories to switch off if they misfire on your app, e.g. "nosqli,cmdi".
       # sqli xss cmdi lfi ssrf rce ssti xxe nosqli crlf scanner
       WAF_DISABLED_CATEGORIES: ${WAF_DISABLED_CATEGORIES:-}
+      # Automatic IP bans: this many blocked requests within the window bans the
+      # IP for the duration (0 disables). Allowlist: comma-separated exact IPs.
+      WAF_BAN_THRESHOLD: ${WAF_BAN_THRESHOLD:-20}
+      WAF_BAN_WINDOW_S: ${WAF_BAN_WINDOW_S:-600}
+      WAF_BAN_DURATION_S: ${WAF_BAN_DURATION_S:-3600}
+      WAF_BAN_ALLOWLIST: ${WAF_BAN_ALLOWLIST:-}
       # Lets the dashboard's "Flag false positive" button post to ml-api /feedback.
       FEEDBACK_API_KEY: ${FEEDBACK_API_KEY:-}
       # Path/header/cookie inspection: monitor until checked against real traffic.
@@ -56,6 +62,7 @@ services:
       - ./waf_admin.lua:/etc/openresty/waf/waf_admin.lua:ro
       - ./waf_rules.lua:/etc/openresty/waf/waf_rules.lua:ro
       - ./waf_dashboard.lua:/etc/openresty/waf/waf_dashboard.lua:ro
+      - ./waf_bans.lua:/etc/openresty/waf/waf_bans.lua:ro
       - ./admin:/etc/openresty/waf/admin:ro
       # JSON access logs (json_waf), read by Alloy.
       - waf_logs:/var/log/waf

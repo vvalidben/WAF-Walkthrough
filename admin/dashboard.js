@@ -27,8 +27,9 @@
   const ACTION = {
     block: ["BLOCKED", ...RED], reject: ["REJECTED", ...RED], fail_closed: ["FAIL-CLOSED", ...RED],
     monitor: ["MONITORED", ...AMBER], fail_open: ["FAIL-OPEN", ...AMBER], allow: ["ALLOWED", ...GREEN],
+    banned: ["BANNED", ...RED],
   };
-  const FILTERS = { ALL: null, BLOCKED: ["block", "reject", "fail_closed"], MONITORED: ["monitor", "fail_open"] };
+  const FILTERS = { ALL: null, BLOCKED: ["block", "reject", "fail_closed", "banned"], MONITORED: ["monitor", "fail_open"] };
   const TABS = [["overview", "Overview"], ["feed", "Threat feed"], ["event", "Request detail"],
                 ["rules", "Rules"], ["console", "Test console"]];
   const SAMPLES = [
@@ -41,7 +42,7 @@
 
   const state = {
     status: null, overview: null, overviewAt: 0, feed: [], seen: new Set(), fresh: new Set(), feedLoaded: false,
-    paused: false, filter: "ALL", event: null, eventError: null, rules: null, rulesMsg: null,
+    paused: false, filter: "ALL", event: null, eventError: null, rules: null, rulesMsg: null, bans: null, bansMsg: null,
     console: { method: "GET", path: "/search?q=", payload: SAMPLES[0][1], result: null, error: null },
     flagged: {}, actionMsg: null, error: null,
   };
@@ -68,6 +69,10 @@
   const hour = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
   const cat = (c) => CATEGORY[c] || CATEGORY.other;
   const decodeUri = (uri) => { try { return decodeURIComponent(uri.replace(/\+/g, " ")); } catch (e) { return uri; } };
+  const minutes = (s) => {
+    const hrs = Math.floor(s / 3600), mins = Math.ceil((s % 3600) / 60);
+    return hrs ? (mins ? `${hrs} h ${mins} min` : `${hrs} h`) : `${mins} min`;
+  };
 
   function pill(text, color, bg, extra) {
     return h("span", { class: "pill" + (extra ? " " + extra : ""), style: { borderColor: color, color, background: bg || "transparent" } }, text);
@@ -127,6 +132,8 @@
       h("span", { style: { color } }, monitor ? "MONITOR ONLY" : "BLOCKING · ACTIVE"));
     $("threshold").textContent = String(s.threshold);
     $("rules-on").textContent = s.rules_on + " / " + s.rules_total;
+    $("bans-now").textContent = s.bans && s.bans.enabled ? String(s.bans.active) : "off";
+    $("bans-now").style.color = s.bans && s.bans.active ? "#ff4f64" : "";
     const target = s.target ? s.target.url.replace(/^https?:\/\//, "") : "?";
     $("target").textContent = target;
     $("target").title = s.target ? s.target.url : "";
@@ -181,14 +188,37 @@
         return h("div", { class: "list-row ip-row" },
           h("div", { class: "stack" }, h("span", { style: { color: "#e8f2f7" } }, p.ip),
             h("span", { class: "panel-sub ellipsis" }, (p.category || "other") + " · " + (p.rule || "—") + " · last " + time(p.last))),
-          pill(hostile ? "HOSTILE" : "WATCH", hostile ? "#ff4f64" : "#ffb547"),
+          p.banned ? pill("BANNED", ...RED) : pill(hostile ? "HOSTILE" : "WATCH", hostile ? "#ff4f64" : "#ffb547"),
           h("span", { class: "num" }, fmt(p.blocked)));
       }) : h("div", { class: "empty" }, "No blocked sources in the last 24 hours."));
 
     const notes = [];
     if (o.fail_open) notes.push(h("div", { class: "msg" }, `${fmt(o.fail_open)} request(s) passed without an ML score (fail-open): the model was too slow or down.`));
     if (o.truncated) notes.push(h("div", { class: "msg" }, "Very busy day: only the first 500,000 log lines were counted."));
-    return [head, h("div", { class: "stats" }, stats), chart, h("div", { class: "two" }, rules, ips), notes];
+    return [head, h("div", { class: "stats" }, stats), chart, h("div", { class: "two" }, rules, ips), bansPanel(), notes];
+  }
+
+  function bansPanel() {
+    const b = state.bans;
+    if (!b) return null;
+    const s = b.settings;
+    const rule = s.enabled
+      ? `An IP is banned for ${minutes(s.duration)} after ${s.threshold} blocked requests within ${minutes(s.window)}. Banned IPs get 403 without inspection.`
+      : "Automatic bans are off (WAF_BAN_THRESHOLD=0). You can still ban an IP from its request detail.";
+    const rows = b.bans.map((ban) => h("div", { class: "list-row ban-row" },
+      h("div", { class: "stack" }, h("span", { style: { color: "#e8f2f7" } }, ban.ip,
+        ban.ip === b.your_ip ? h("span", { class: "panel-sub" }, "  (this computer)") : null),
+        h("span", { class: "panel-sub" }, ban.by === "auto"
+          ? `automatic · ${fmt(ban.blocks)} blocked requests${ban.category ? " · mostly " + ban.category : ""}`
+          : "banned from the dashboard")),
+      h("span", { class: "panel-sub num" }, "expires in " + minutes(ban.remaining)),
+      h("button", { class: "btn", onclick: () => setBan(ban.ip, "unban") }, "UNBAN")));
+    return h("div", { class: "panel" },
+      h("div", { class: "head-row", style: { alignItems: "baseline", marginBottom: "8px" } },
+        h("span", { class: "panel-title" }, "BANNED IPS"), pill(b.bans.length + " ACTIVE", b.bans.length ? "#ff4f64" : "#6c7f8c")),
+      h("div", { class: "panel-sub" }, rule),
+      state.bansMsg && h("div", { class: "msg " + (state.bansMsg.ok ? "ok" : "bad"), style: { marginTop: "10px" } }, state.bansMsg.text),
+      rows.length ? rows : h("div", { class: "empty" }, "No IP is banned right now."));
   }
 
   function feedScreen() {
@@ -213,7 +243,7 @@
       // For allowed requests the source is just the highest-scored value: shown dim, not as an attack.
       h("td", { class: "td-payload" + (e.payload && e.category ? "" : " none"), title: e.payload || (e.source ? "value not logged (" + e.source + ")" : "") },
         e.payload || (e.source ? "· " + e.source : "—")),
-      h("td", { style: { color: "#9fb2bf" } }, e.signature || (e.engine === "ml" && e.category ? "ml model" : "—")),
+      h("td", { style: { color: "#9fb2bf" } }, e.signature || (e.engine === "ml" && e.category ? "ml model" : e.action === "banned" ? "ip banned" : "—")),
       h("td", { class: "right" }, e.score != null ? e.score.toFixed(2) : "—"),
       h("td", { class: "right" }, actionPill(e.action))));
 
@@ -278,6 +308,11 @@
         h("span", null, "USER_AGENT"), h("span", { style: { color: "#9fb2bf" } }, e.ua),
         h("span", null, "CATEGORY"), h("span", null, e.category ? cat(e.category)[0] : "—"),
         h("span", null, "BLOCKED_24H"), h("span", null, fmt(e.ip_blocked_24h)),
+        h("span", null, "BAN"), h("span", { style: { color: e.ban ? "#ff4f64" : null } }, e.ban
+          ? `banned, expires in ${minutes(e.ban.expires - Math.floor(Date.now() / 1000))}`
+          : e.ban_allowlisted ? "allowlisted, never banned"
+            : state.status && state.status.bans && state.status.bans.enabled
+              ? `not banned (${e.ban_strikes} of ${state.status.bans.threshold} strikes in the current window)` : "not banned"),
         h("span", null, "REASON"), h("span", null, e.reason || "—")));
 
     const buttons = h("div", { class: "btn-row" },
@@ -286,7 +321,9 @@
         consoleForm = null; go("console");
       } }, "REPLAY IN CONSOLE"),
       ml && (e.action === "block" || e.action === "monitor") && h("button", { class: "btn", style: { padding: "10px 16px" }, disabled: flagged, onclick: flagFalsePositive }, flagged ? "FLAGGED" : "FLAG FALSE POSITIVE"),
-      e.engine === "regex" && e.signature && h("button", { class: "btn", style: { padding: "10px 16px" }, onclick: () => switchOff(e.signature) }, "SWITCH OFF RULE " + e.signature));
+      e.engine === "regex" && e.signature && h("button", { class: "btn", style: { padding: "10px 16px" }, onclick: () => switchOff(e.signature) }, "SWITCH OFF RULE " + e.signature),
+      e.ban ? h("button", { class: "btn", style: { padding: "10px 16px" }, onclick: () => setBan(e.ip, "unban") }, "UNBAN " + e.ip)
+        : !e.ban_allowlisted && h("button", { class: "btn", style: { padding: "10px 16px", borderColor: "#ff4f64", color: "#ff4f64" }, onclick: () => setBan(e.ip, "ban") }, "BAN THIS IP"));
     const msg = state.actionMsg && h("div", { class: "msg " + (state.actionMsg.ok ? "ok" : "bad") }, state.actionMsg.text);
 
     return [back, title, h("div", { class: "grid-2" },
@@ -419,6 +456,20 @@
     render();
   }
 
+  async function setBan(ip, action) {
+    const s = state.status && state.status.bans;
+    const hours = s ? minutes(s.duration) : "1 h";
+    if (action === "ban" && !confirm(`Ban ${ip} for ${hours}? All its requests will get 403 until the ban expires or you lift it.`)) return;
+    try {
+      await api("/api/bans", { ip, action });
+      const text = action === "ban" ? `${ip} is banned for ${hours}.` : `${ip} is no longer banned.`;
+      state.actionMsg = state.bansMsg = { ok: true, text };
+      await Promise.all([loadBans(), loadStatus()]);
+      if (state.event && state.event.ip === ip) state.event = await api("/api/event?id=" + encodeURIComponent(state.event.id));
+    } catch (err) { state.actionMsg = state.bansMsg = { ok: false, text: err.message }; }
+    render();
+  }
+
   async function flagFalsePositive() {
     const e = state.event;
     try {
@@ -431,9 +482,12 @@
 
   // ------------------------------------------------------------ data loading
   async function loadStatus() { try { state.status = await api("/api/status"); renderStatus(); } catch (e) { /* keep last */ } }
+  async function loadBans() { try { state.bans = await api("/api/bans"); } catch (e) { /* keep last */ } }
   async function loadOverview() {
-    try { state.overview = await api("/api/overview"); state.overviewAt = Date.now(); state.error = null; }
-    catch (err) { state.error = err.message; }
+    try {
+      [state.overview] = await Promise.all([api("/api/overview"), loadBans()]);
+      state.overviewAt = Date.now(); state.error = null;
+    } catch (err) { state.error = err.message; }
   }
   async function loadFeed() {
     try {
